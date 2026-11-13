@@ -27,6 +27,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
     KVConnectorRole,
+    KVConnectorTransferResults,
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
@@ -69,6 +70,7 @@ if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
         NixlBaseConnectorWorker,
     )
+    from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
@@ -187,9 +189,21 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_new_request(request)
 
+    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.bind_gpu_block_pool(gpu_block_pool)
+
+    def get_external_boundary_tokens(self, request: "Request") -> int:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.get_external_boundary_tokens(request)
+
     def update_connector_output(self, connector_output: KVConnectorOutput):
         assert self.connector_scheduler is not None
         self.connector_scheduler.update_connector_output(connector_output)
+
+    def release_hold(self, request_id: str) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.release_hold(request_id)
 
     def request_finished(
         self,
@@ -241,6 +255,12 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
         return self.connector_worker.get_finished()
+
+    def get_transfer_results(
+        self, finished_req_ids: set[str]
+    ) -> KVConnectorTransferResults:
+        assert self.connector_worker is not None
+        return self.connector_worker.get_transfer_results()
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Get block IDs that failed to load via NIXL."""

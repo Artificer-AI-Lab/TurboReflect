@@ -69,7 +69,7 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
             v_head_dim=128,
         )
         fa_version = get_flash_attn_version()
-        if fa_version == 4:
+        if fa_version == 4 and not current_platform.is_device_capability_family(120):
             return mla_dimensions in [dims_deepseek, dims_mistral_s4]
         else:
             return mla_dimensions in [dims_deepseek, dims_glm, dims_mistral_s4]

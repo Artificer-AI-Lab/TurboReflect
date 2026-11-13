@@ -1,0 +1,50 @@
+# Qwen3.8-27B: hybrid attention, one GPU per engine. Text tasks leave its vision tower
+# off the GPU; qwen3.8-27b-video.yaml runs tasks with clips.
+#
+#   python -m turboreflect calibrate --config turboreflect/configs/qwen3.8-27b.yaml
+#   python -m turboreflect run --config turboreflect/configs/qwen3.8-27b.yaml \
+#       --out-dir runs/qwen3.8-27b
+#
+# For P/D, add the `pd` block of turboreflect/examples/pd.yaml.
+
+model: Qwen/Qwen3.8-27B
+tasks: tasks/my_tasks             # a directory of task files
+program: three_stage              # two_stage, three_stage or multi_round
+
+context_reuse: true
+adaptive_draft_length: true
+kv_cache_dtype: fp8               # fp8 or bf16
+
+gen_tokens: 1024                  # tokens each stage generates
+max_model_len: 147456
+
+temperature: 1.0                  # the model's recommended sampling
+top_p: 0.95
+top_k: 20
+seed_per_program: true
+
+suffix_num_speculative_tokens: 8
+suffix_max_tree_depth: 24
+
+feedback: goal
+refinement: goal
+layout: requote
+
+attention_backend: FLASH_ATTN
+gdn_prefill_backend: flashinfer
+language_model_only: true
+trust_remote_code: true
+gpu_memory_utilization: 0.9
+max_num_batched_tokens: 16384
+
+env:
+  VLLM_SSM_CONV_STATE_LAYOUT: DS
+  VLLM_KV_CACHE_LAYOUT: HND
+
+# To stop each stage at the model's end of sequence:
+#   decode_paths: [quality]
+#   max_tokens_quality: 2048
+
+# RULER and LongBench-v2 tasks have their own stage assembly, which
+# builds one layout:
+#   layout: continue

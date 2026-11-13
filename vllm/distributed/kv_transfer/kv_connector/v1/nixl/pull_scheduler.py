@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -63,15 +64,24 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             actual = self._get_remote_prefill_token_count(len(token_ids))
             count = actual - num_computed_tokens
             if count > 0:
+                params.pop("_mamba_boundary_state", None)
+                if self._has_mamba and (
+                    boundary := self._mamba_boundary_state(
+                        request, actual, num_computed_tokens
+                    )
+                ):
+                    # P's state at the prompt's last block boundary.
+                    params["_mamba_boundary_state"] = boundary
                 return count, True
-
-        if params is not None and params.get("do_remote_decode") and self._has_mamba:
-            self._truncate_mamba_request_for_prefill(request)
 
         if (
             params is not None
             and params.get("do_remote_decode")
             and params.get("remote_block_ids")
+            # One pull per request: after a failed pull or a preemption the
+            # remote blocks may be gone, and update_state_after_alloc would
+            # schedule no second read for the request to wait on.
+            and not params.get("_remote_blocks_processed")
             and all(
                 p in params
                 for p in (
@@ -87,6 +97,11 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             # The tokens will be loaded if not already present
             # in the prefill node local cache
             remote_num_tokens = params.get("remote_num_tokens") or 0
+            if self._has_mamba:
+                # A hybrid P resumes from one of D's exact recurrent states.
+                state = self._mamba_pull_state(request, num_computed_tokens)
+                params["_mamba_pull_state"] = state
+                remote_num_tokens = 0 if state is None else state[0]
             count = (
                 min(remote_num_tokens, request.num_prompt_tokens) - num_computed_tokens
             )
@@ -109,6 +124,12 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         # No remote prefill for this request.
         return 0, False
 
+    def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
+        """Also unpin the boundary states exported with holds that ended."""
+        super().update_connector_output(connector_output)
+        for req_id in connector_output.finished_sending or ():
+            self._release_mamba_state_pins(req_id)
+
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
@@ -123,9 +144,9 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         if not params:
             return
 
-        if params.get("do_remote_decode") or (
-            params.get("do_remote_prefill") and self.is_bidirectional_kv_xfer_enabled
-        ):
+        # Under bidirectional transfer D may hold any request's blocks for a
+        # later pull, a local one included; an untracked hold is never freed.
+        if params.get("do_remote_decode") or self.is_bidirectional_kv_xfer_enabled:
             self._reqs_in_batch.add(request.request_id)
         if self.use_host_buffer and params.get("do_remote_decode"):
             # NOTE: when accelerator is not directly supported by Nixl,
@@ -150,14 +171,22 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                     # a full prefix cache hit on the local node. We need to call
                     # send_notif in _read_blocks to free the memory on the remote node.
 
+                    state = params.pop("_mamba_pull_state", None)
+                    if num_external_tokens > 0 and state is not None:
+                        self._cut_to_mamba_state(params, state)
+                    boundary = params.pop("_mamba_boundary_state", None)
                     unhashed_local_block_ids: BlockIds = (
                         blocks.get_unhashed_block_ids_all_groups()
                         if num_external_tokens > 0
                         else ()
                     )
-                    local_block_ids = self.get_sw_clipped_blocks(
+                    local_block_ids = self.get_exchange_clipped_blocks(
                         unhashed_local_block_ids
                     )
+                    if num_external_tokens > 0 and boundary is not None:
+                        local_block_ids = self._add_mamba_boundary_read(
+                            params, boundary, blocks, local_block_ids
+                        )
 
                     # Get unhashed blocks to pull from remote. Mind that a full prefix
                     # cache hit is indicated with an empty list.
@@ -200,7 +229,11 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         if not params:
             return False, None
 
-        is_p_node = bool(params.get("do_remote_decode"))
+        # `decode_after_pull`: a pull of a remote hold that this engine then
+        # decodes itself, so it finishes as a D does.
+        is_p_node = bool(params.get("do_remote_decode")) and not params.get(
+            "decode_after_pull"
+        )
         is_d_node = not is_p_node
 
         # Stop heartbeating for aborted requests that never reached finished_recving:
@@ -220,7 +253,11 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             params["do_remote_prefill"] = False
             return False, None
 
-        if is_d_node and not self.is_bidirectional_kv_xfer_enabled:
+        if is_d_node and (
+            not self.is_bidirectional_kv_xfer_enabled
+            # The client knows no later turn will read these blocks back.
+            or params.get("decoder_kv_blocks_hold") is False
+        ):
             return False, None
 
         if request.status not in (
@@ -239,6 +276,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         delay_free_blocks = any(len(group) > 0 for group in block_ids)
         remote_num_tokens = 0
         blocks_expiry_time = None
+        blocks_lease_duration = None
         if delay_free_blocks:
             # Prefill request on remote. It will be read from D upon completion
             request_kv_blocks_ttl = self._kv_lease_duration
@@ -255,17 +293,42 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             self._reqs_need_send[request.request_id] = (
                 time.perf_counter() + request_kv_blocks_ttl
             )
-            if is_d_node:
-                # D blocks expiry time exported for the turn-2 readback.
-                blocks_expiry_time = self._reqs_need_send[request.request_id]
+            # The reader may read the blocks until this time only.
+            blocks_expiry_time = self._reqs_need_send[request.request_id]
+            blocks_lease_duration = request_kv_blocks_ttl
             # NOTE HMA will "mark" empty/null blocks in groups with 0s (eg SWA ones),
             # trimming down after allocating for the whole sequence length. Empty
             # blocks are always at the start of the list.
             # Here we "unpad" blocks to send the actual remote blocks to be read.
-            block_ids = self.get_sw_clipped_blocks(block_ids)
+            block_ids = self.get_exchange_clipped_blocks(block_ids)
 
-            remote_num_tokens = request.num_computed_tokens
+            remote_num_tokens = min(request.num_computed_tokens, request.num_tokens)
 
+        mamba_export = {}
+        if is_d_node and self._has_mamba:
+            mamba_export = dict(
+                remote_mamba_states=self._export_mamba_states(
+                    request, remote_num_tokens, block_ids
+                )
+                if delay_free_blocks
+                else [],
+                remote_block_size=self.block_size,
+            )
+        elif (
+            self._has_mamba
+            and delay_free_blocks
+            and (
+                states := self._export_mamba_states(
+                    request, remote_num_tokens, block_ids
+                )
+            )
+        ):
+            # A hybrid P's state at its prompt's last block boundary, which D
+            # caches as it would a prompt prefilled there
+            # (`_mamba_boundary_state`).
+            mamba_export = dict(
+                remote_mamba_states=states, remote_block_size=self.block_size
+            )
         return delay_free_blocks, dict(
             do_remote_prefill=is_p_node,
             do_remote_decode=is_d_node,
@@ -277,4 +340,6 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
             remote_num_tokens=remote_num_tokens,
             remote_blocks_expiry_time=blocks_expiry_time,
+            remote_blocks_lease_duration=blocks_lease_duration,
+            **mamba_export,
         )

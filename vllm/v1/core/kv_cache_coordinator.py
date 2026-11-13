@@ -14,6 +14,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    MambaManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -118,6 +119,17 @@ class KVCacheCoordinator(ABC):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+        # Order in which a finished request's groups return their blocks to
+        # the pool. A Mamba group's reusable state is a single block, and
+        # evicting it voids the hybrid hit for every attention block of that
+        # prefix, so attention groups go first (evicted first) and Mamba
+        # groups last; single-group models are unaffected.
+        self._free_order = tuple(
+            sorted(
+                self.single_type_managers,
+                key=lambda manager: isinstance(manager, MambaManager),
+            )
+        )
 
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
@@ -188,6 +200,30 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
         return num_blocks_to_allocate
+
+    def num_external_boundary_blocks(
+        self, boundary_tokens: int, num_computed_tokens: int
+    ) -> int:
+        """Count the blocks `add_external_boundary_blocks` takes for a load."""
+        return sum(
+            isinstance(manager, MambaManager)
+            and manager.takes_external_boundary_state(
+                boundary_tokens, num_computed_tokens
+            )
+            for manager in self.single_type_managers
+        )
+
+    def add_external_boundary_blocks(
+        self, request_id: str, boundary_tokens: int, num_computed_tokens: int
+    ) -> None:
+        """Back a pending load's boundary state with a block in each Mamba group."""
+        for manager in self.single_type_managers:
+            if isinstance(manager, MambaManager) and (
+                manager.takes_external_boundary_state(
+                    boundary_tokens, num_computed_tokens
+                )
+            ):
+                manager.add_external_boundary_block(request_id, boundary_tokens)
 
     def allocate_new_computed_blocks(
         self,
@@ -294,7 +330,7 @@ class KVCacheCoordinator(ABC):
         Args:
             request_id: The request ID.
         """
-        for manager in self.single_type_managers:
+        for manager in self._free_order:
             manager.free(request_id)
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
@@ -312,7 +348,7 @@ class KVCacheCoordinator(ABC):
             The request's blocks in allocation order.
         """
         blocks: list[KVCacheBlock] = []
-        for manager in self.single_type_managers:
+        for manager in reversed(self._free_order):
             blocks.extend(manager.pop_blocks_for_free(request_id))
         return blocks
 
@@ -632,6 +668,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # a tighter initial bound, reducing work for subsequent groups.
         self.attention_groups.sort(
             key=lambda g: not isinstance(g.spec, FullAttentionSpec)
+        )
+
+        # Dense reference group for per-group lookups (None when the model
+        # has no full-attention layers): full attention is downward-closed,
+        # so any group reporting a longer per-group hit implies the union of
+        # per-group hits is not consistent at a single boundary (#46453).
+        first = self.attention_groups[0]
+        self.full_attention_group_id: int | None = (
+            first.group_ids[0] if isinstance(first.spec, FullAttentionSpec) else None
         )
 
         # Propagate the eagle bit to each manager (default to ``use_eagle=False``).

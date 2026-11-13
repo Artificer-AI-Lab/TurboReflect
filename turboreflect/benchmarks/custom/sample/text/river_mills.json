@@ -1,0 +1,16 @@
+{
+  "id": "river_mills",
+  "system": "You are a careful analyst. You answer questions about long material using only that material, and you show the evidence for every conclusion.",
+  "user_task": "I need a reliable answer to the question that follows the material below, with the reasoning shown so I can check it. Use only the material. Pick one option, quote the passages that decide it, and explain why each of the other options is wrong. Finish with a line of the form \"The correct answer is (X)\".\n\nDeliverable: a written answer of about 300 to 600 words containing the chosen option; the quoted evidence, with where each passage sits; one reason for each rejected option; and the final line \"The correct answer is (X)\".",
+  "context": {
+    "ledger": "Town ledger, river mills\n\nAshford Mill. Grain. Opened 1841. Wheel removed in the spring of 1902, after the weir failed; the building was sold as a warehouse.\n\nBrook Mill. Paper. Opened 1858. Still at work when this ledger was closed in 1910.\n\nCalder Mill. Wool. Opened 1867. Sold to the Ferris family in 1899. Work stopped in the winter of 1907.",
+    "newspaper": "The Valley Courier, 14 March 1903\n\nReaders have written to ask about the mills. Duncan Mill, the last of the fulling mills, lost its roof in the storm of 1897 and has not ground or fulled since. The Ferris family say Calder Mill has orders for years to come. Brook Mill is hiring.",
+    "question": "Question\nAccording to these records, which mill stopped working first?\n\n(A) Ashford Mill\n(B) Brook Mill\n(C) Calder Mill\n(D) Duncan Mill"
+  },
+  "rubric": [
+    "overall goal: answer the question from the material and show why — judge: the response ends with one line \"The correct answer is (X)\" naming exactly one option, and that choice follows from evidence quoted from the material",
+    "ground the answer in the material — judge: every quoted passage appears in the material and bears on the question; no step relies on outside knowledge",
+    "rule out the other options — judge: each option not chosen is rejected with a specific reason taken from the material",
+    "use every document the question depends on — judge: each quote names the document it comes from, and both documents are quoted at least once"
+  ]
+}

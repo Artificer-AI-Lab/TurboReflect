@@ -1,110 +1,232 @@
-<!-- markdownlint-disable MD001 MD041 -->
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
-    <img alt="vLLM" src="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-light.png" width=55%>
-  </picture>
-</p>
+# TurboReflect: Infrastructure Optimization for Efficient Agentic Reflection
 
-<h3 align="center">
-Easy, fast, and cheap LLM serving for everyone
-</h3>
+This is the repository accompanying the paper:
 
-<p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
-</p>
+> **TurboReflect: Infrastructure Optimization for Efficient Agentic Reflection**
+>
+> Anonymous submission
 
-🔥 We have built a vLLM website to help you get started with vLLM. Please visit [vllm.ai](https://vllm.ai) to learn more.
-For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
 
----
+## Overview
 
-## About
+TurboReflect is a training-free, model-agnostic system that accelerates each reflection program as one unit. A reflection program runs generation, feedback and refinement stages in sequence, optionally over several rounds or with feedback and refinement merged into one stage. Later stages share almost all of their context with the stage before, and much of what they write is copied from it. TurboReflect removes this repeated work with four components:
 
-vLLM is a fast and easy-to-use library for LLM inference and serving.
+- **Program-level context reuse**: each later stage resumes from its predecessor's KV cache in place, and prefills only what it appends.
+- **Adaptive draft length**: drafts come from SuffixDecoding, and their lengths are set from verification times measured on the deployment. Drafts are only shortened, so outputs keep the model's distribution.
+- **Locality-aware P/D disaggregation**: each stage favors the instance that holds its context, within a relative decode-latency budget δ.
+- **KV cache quantization**: vLLM's FP8 KV cache, which keeps more contexts resident. Verification times are measured at the KV precision in use, so draft lengths suit FP8 as well.
 
-Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has grown into one of the most active open-source AI projects built and maintained by a diverse community of many dozens of academic institutions and companies from over 2000 contributors.
+![Overview of TurboReflect](docs/turboreflect/overview.png)
 
-vLLM is fast with:
+*vLLM (top) and TurboReflect (bottom) on one reflection program. Each component extends a standard inference technique (black) with what reflection needs (blue).*
 
-- State-of-the-art serving throughput
-- Efficient management of attention key and value memory with [**PagedAttention**](https://blog.vllm.ai/2023/06/20/vllm.html)
-- Continuous batching of incoming requests, chunked prefill, prefix caching
-- Fast and flexible model execution with piecewise and full CUDA/HIP graphs
-- Quantization: FP8, MXFP8/MXFP4, NVFP4, INT8, INT4, GPTQ/AWQ, GGUF, compressed-tensors, ModelOpt, TorchAO, and [more](https://docs.vllm.ai/en/latest/features/quantization/index.html)
-- Optimized attention kernels including FlashAttention, FlashInfer, TRTLLM-GEN, FlashMLA, and Triton
-- Optimized GEMM/MoE kernels for various precisions using CUTLASS, TRTLLM-GEN, CuTeDSL
-- Speculative decoding including n-gram, suffix, EAGLE, DFlash
-- Automatic kernel generation and graph-level transformations using torch.compile
-- Disaggregated prefill, decode, and encode
+On offline batches of reflection tasks, across four models spanning latent, grouped-query and hybrid attention, TurboReflect reduces cost by up to 3.1× and decode latency by up to 5.2× relative to vLLM in its default configuration. It reduces cost by up to 2.7× even when vLLM enables its native speculative decoding, KV cache quantization and P/D disaggregation, while preserving overall task performance.
 
-vLLM is flexible and easy to use with:
 
-- Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
-- Tensor, pipeline, data, expert, and context parallelism for distributed inference
-- Streaming outputs
-- Generation of structured outputs using xgrammar or guidance
-- Tool calling and reasoning parsers
-- OpenAI-compatible API server, plus Anthropic Messages API and gRPC support
-- Efficient multi-LoRA support for dense and MoE layers
-- Support for NVIDIA GPUs, AMD GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, and more.
+## What is in this repository
 
-vLLM seamlessly supports 200+ model architectures on Hugging Face, including:
+TurboReflect is built on vLLM v0.26.0. The system is in `turboreflect/`, and vLLM with its changes in `vllm/`:
 
-- Decoder-only LLMs (e.g., Llama, Qwen, Gemma)
-- Mixture-of-Expert LLMs (e.g., Mixtral, DeepSeek-V3, Qwen-MoE, GPT-OSS)
-- Hybrid attention and state-space models (e.g., Mamba, Qwen3.5)
-- Multi-modal models (e.g., LLaVA, Qwen-VL, Pixtral)
-- Embedding and retrieval models (e.g., E5-Mistral, GTE, ColBERT)
-- Reward and classification models (e.g., Qwen-Math)
+- `turboreflect/__main__.py`: the command line entry point (`run`, `calibrate`, `report`).
+- `turboreflect/config.py`: reads a run configuration and turns the component switches into engine settings.
+- `turboreflect/program/`: reflection programs: task files, stage prompts, two-stage, three-stage and multi-round shapes, video inputs.
+- `turboreflect/engine/`: runs a batch of programs on one engine, the setup without P/D.
+- `turboreflect/context_reuse/`: the scheduler that holds a finished stage's KV cache for its successor.
+- `turboreflect/adaptive_draft/`: per-step draft lengths from the measured step-time model.
+- `turboreflect/locality_pd/`: stage placement, the δ budget, multi-engine execution and KV transfer.
+- `turboreflect/calibration/`: deployment calibration of step times and P/D costs.
+- `turboreflect/metrics/`: step records, run metrics and the output directory.
+- `turboreflect/benchmarks/`: synthesis and automatic run scripts for RULER and LongBench-v2, and sample tasks and a format verifier for building your own benchmark.
+- `turboreflect/configs/`: one configuration per model, which states that model's settings, and one for video tasks.
+- `turboreflect/examples/`: a small end-to-end example and a P/D configuration.
+- `vllm/`: vLLM with the scheduler hooks, verification paths and KV transfer changes TurboReflect needs; see [changes to vLLM](docs/turboreflect/vllm-changes.md).
 
-Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
+The commit "vLLM v0.26.0" holds that release unchanged, so a diff against it shows every change.
 
-## Getting Started
 
-Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
+## Setup
+
+### 1. Create the environment
+
+The build needs `g++` 10 or newer, which compiles `arctic-inference`, and OpenSSL 3, which NIXL links against.
 
 ```bash
-uv pip install vllm
+# from the root of this repository
+uv venv --managed-python --python 3.12
+source .venv/bin/activate
+uv pip install --torch-backend=cu130 --index-strategy unsafe-best-match \
+    -r requirements/turboreflect/cu130.txt
+
+# this source tree on the binaries of vLLM v0.26.0
+WHEEL=vllm-0.26.0-cp38-abi3-manylinux_2_28_$(uname -m).whl
+VLLM_USE_PRECOMPILED=1 \
+    VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.26.0/$WHEEL \
+    VLLM_VERSION_OVERRIDE=0.26.0+turboreflect \
+    uv pip install --no-build-isolation --no-deps -e .
+
+# SuffixDecoding
+uv pip install --constraint requirements/turboreflect/cu130.txt \
+    --index-strategy unsafe-best-match arctic-inference==0.1.1
 ```
 
-Or [build from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source) for development.
+`cu130` needs an NVIDIA driver of 580 or newer. For CUDA 12.9 (driver 575 or newer), replace `cu130` with `cu129` and use the wheel `vllm-0.26.0+cu129-cp38-abi3-manylinux_2_28_$(uname -m).whl`.
 
-Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
+### 2. Get a model
 
-- [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-- [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
-- [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
+TurboReflect runs any model vLLM serves: a new model needs only a configuration file and deployment calibration, no code; see [adding a model](docs/turboreflect/adding-a-model.md). `model` takes a Hugging Face repo id, downloaded on first use, or a local checkpoint.
 
-## Contributing
+`turboreflect/configs/` has a ready file for each tested model: GLM-4.7-Flash, Qwen3-14B, Qwen3.8-27B and Kimi-K2.6. These pin attention backends for compute capability 9.x (10.x for Kimi-K2.6); on other GPUs, set `attention_backend: null`.
 
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
 
-## Citation
+## Usage
 
-If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs/2309.06180):
+### Quick start
 
-```bibtex
-@inproceedings{kwon2023efficient,
-  title={Efficient Memory Management for Large Language Model Serving with PagedAttention},
-  author={Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
-  booktitle={Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles},
-  year={2023}
+```bash
+bash turboreflect/examples/quickstart.sh
+```
+
+This needs one GPU with at least 48 GB of memory. It builds the first eight items of [LongBench-v2](https://github.com/THUDM/LongBench) as tasks for Qwen3-14B, calibrates, runs them, writes the results to `runs/quickstart/` and prints each run's makespan, cost, decode latency, prefix hit ratio and draft acceptance.
+
+### Example
+
+One of the quick start's tasks, `tasks/quickstart/data/longbench_670aac92bb02136c067d218a_32k.json`, with its document shortened here:
+
+```json
+{
+  "id": "longbench_670aac92bb02136c067d218a_32k",
+  "system": "",
+  "user_task": "Please read the following text and answer the question below.\n\n<text>\n{context}\n</text>\n\nWhat is the correct answer to this question: Which floor do Becca DiNuzio and Greg Barney live on?\nChoices:\n(A) The first floor\n(B) The second floor\n(C) The third floor\n(D) There are contradictory descriptions\n\nFormat your response as follows: \"The correct answer is (insert answer here)\".",
+  "context": {
+    "document": "My fault, my failure, is not in the passions I have, but in my lack of control of them. —Jack Kerouac ..."
+  },
+  "rubric": [],
+  "source": {"bench": "longbench-v2", "prompt": "0shot", "tier": "32k", "truncated": true}
 }
 ```
 
-## Contact Us
+`user_task` is LongBench-v2's own prompt, and the document, a detective novel middle-truncated to fit 32,000 tokens, fills its `{context}` slot. The gold answer is kept apart in `rubrics/`, which a run never reads. A three-stage program runs it as follows:
 
-<!-- --8<-- [start:contact-us] -->
-- For technical questions and feature requests, please use GitHub [Issues](https://github.com/vllm-project/vllm/issues)
-- For discussing with fellow users, please use the [vLLM Forum](https://discuss.vllm.ai)
-- For coordinating contributions and development, please use [Slack](https://slack.vllm.ai)
-- For security disclosures, please use GitHub's [Security Advisories](https://github.com/vllm-project/vllm/security/advisories) feature
-- For collaborations and partnerships, please contact us at [collaboration@vllm.ai](mailto:collaboration@vllm.ai)
-<!-- --8<-- [end:contact-us] -->
+- **Generation** answers the question, ending with "The correct answer is (X)".
+- **Feedback** reviews that answer against the document and asks for the most important changes.
+- **Refinement** revises the answer as the review asks.
 
-## Media Kit
+### Configure a run
 
-- If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)
+Edit these lines of the model's file, for example `turboreflect/configs/qwen3-14b.yaml`; its other fields need no change:
+
+```yaml
+tasks: tasks/my_tasks             # the directory of your task files
+program: three_stage              # two_stage, three_stage or multi_round
+
+context_reuse: true               # program-level context reuse
+adaptive_draft_length: true       # adaptive draft length
+kv_cache_dtype: fp8               # KV cache quantization
+```
+
+Set `context_reuse` or `adaptive_draft_length` to `false`, or `kv_cache_dtype` to `bf16`, to turn that component off.
+
+By default each stage generates exactly `gen_tokens` tokens, past the end of sequence, to measure speed. To score the outputs, add `decode_paths: [quality]`, which stops each stage at the end of sequence.
+
+For locality-aware P/D, add a `pd` block to the file. This one runs two prefill and two decode engines, one GPU each:
+
+```yaml
+pd:
+  prefill: 2                      # prefill engines
+  decode: 2                       # decode engines
+  delta: 1.0                      # the relative decode-latency budget δ
+  max_num_seqs: 17                # programs per engine, see below
+```
+
+`max_num_seqs` is required for P/D: calibrate the file without its `pd` block first, and it prints the value. `turboreflect/examples/pd.yaml` is a complete P/D file, and every setting is in the [configuration reference](docs/turboreflect/configuration.md).
+
+### Calibrate the deployment
+
+Adaptive draft length and locality-aware P/D read times measured on your deployment. Calibrate once per model, GPU and configuration; `run` finds the results on its own:
+
+```bash
+python -m turboreflect calibrate --config turboreflect/configs/qwen3-14b.yaml
+```
+
+### Run
+
+```bash
+python -m turboreflect run --config turboreflect/configs/qwen3-14b.yaml --out-dir runs/my_run
+```
+
+Key arguments of `run`; `calibrate` takes the same, except `--dry-run`:
+
+- `--config`: the run configuration.
+- `--tasks`, `--model`, `--out-dir`: override these fields of the configuration.
+- `--set NAME=VALUE`: override any field; a dotted name reaches into a block, as in `--set pd.delta=0.5`.
+- `--dry-run`: check that every task fits `max_model_len` without starting an engine.
+
+`python -m turboreflect report runs/my_run` prints the table again from the run directories.
+
+
+## Benchmarks
+
+Scripts for RULER and LongBench-v2 build the tasks from the original data, run them and export the answers of the generation and refinement stages in each benchmark's own format, to be scored with its own tool:
+
+```bash
+# RULER (https://github.com/NVIDIA/RULER): four tasks of 50 items each
+bash turboreflect/benchmarks/run_ruler.sh turboreflect/configs/qwen3-14b.yaml ruler_assets
+
+# LongBench-v2 (https://github.com/THUDM/LongBench): all 503 items, documents
+# middle-truncated to TARGET tokens of the model's tokenizer, 32,000 by default
+bash turboreflect/benchmarks/run_longbench_v2.sh turboreflect/configs/qwen3-14b.yaml [TARGET]
+```
+
+[`turboreflect/benchmarks/README.md`](turboreflect/benchmarks/README.md) shows how to fetch RULER's haystack material into `ruler_assets`, the step-by-step commands, the decoding settings and how to score.
+
+### Build your own benchmark
+
+Collect tasks for your own scenario and write each as one JSON file in the [task format](docs/turboreflect/task-format.md), which walks through a text task and a video task: its documents, the task, and the criteria its answer is judged against, with video clips if it has any. `turboreflect/benchmarks/custom/` gives a sample text task and a sample video task to follow, and the format verifier. Any folder of tasks that passes the verifier runs as a benchmark; run it with `decode_paths: [quality]`:
+
+```bash
+python -m turboreflect.benchmarks.custom.verify_format my_tasks/
+python -m turboreflect calibrate --config turboreflect/configs/qwen3-14b.yaml --tasks my_tasks
+python -m turboreflect run --config turboreflect/configs/qwen3-14b.yaml --tasks my_tasks --out-dir runs/my_tasks
+```
+
+Score each program's `artifact` with your benchmark's own tool.
+
+
+## Inputs and Outputs
+
+### Inputs
+
+- **Task files**: one JSON file per task, with `id`, `system`, `user_task`, `context` and `rubric`, and optional `videos`.
+- **Run configuration**: the model, the components to enable and the engine settings.
+- **Calibration files**: written by `calibrate` and read by adaptive draft length and locality-aware P/D.
+
+### Outputs
+
+- **`summary.json`**: makespan, cost, decode latency, mean program end-to-end latency, throughput, prefix hit ratio, matched prefix and append lengths, draft acceptance, KV cache usage and P/D handoff times.
+- **One record per program**: each stage's numbers and its generation, feedback or refinement text.
+- **Step logs**: per-step engine records, from which decode latency is computed.
+
+Cost is reported in GPU-seconds, and in dollars per million tokens when a GPU-hour price is set with `gpu_hour_usd`. A run writes these into a directory of its own under `--out-dir`, described in [the run directory](docs/turboreflect/run-directory.md).
+
+
+## Notes on the Current Implementation
+
+- TurboReflect targets offline batches of reflection programs.
+- Locality-aware P/D uses NIXL for KV transfer and runs its engines on one node.
+- Video tasks run on models with a video encoder; see `turboreflect/configs/`.
+
+
+## Acknowledgements
+
+This work builds on:
+
+- [vLLM](https://github.com/vllm-project/vllm): the inference engine TurboReflect extends.
+- [SuffixDecoding](https://github.com/snowflakedb/ArcticInference): the draft method used by adaptive draft length.
+- [NIXL](https://github.com/ai-dynamo/nixl): KV transfer between instances.
+- [FlashInfer](https://github.com/flashinfer-ai/flashinfer): attention kernels.
+- [RULER](https://github.com/NVIDIA/RULER) and [LongBench](https://github.com/THUDM/LongBench): the public benchmarks with scripts in this repository.
+
+
+## License
+
+Apache-2.0, as vLLM. [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) lists the code adapted from RULER and LongBench, with their licenses.

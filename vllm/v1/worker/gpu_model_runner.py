@@ -188,6 +188,7 @@ from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
@@ -806,6 +807,12 @@ class GPUModelRunner(
         self.num_accepted_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
         )
+        # The count includes the bonus token, so one is the minimum, and the
+        # recurrent kernels pick their state slot as `accepted - 1`. Dummy runs
+        # skip `_prepare_inputs`, so the zeros from the allocation would reach
+        # those kernels as index -1 and fault on the out-of-bounds read.
+        self.num_accepted_tokens.np.fill(1)
+        self.num_accepted_tokens.copy_to_gpu()
 
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -2206,7 +2213,7 @@ class GPUModelRunner(
             target = self.mrope_positions if self.uses_mrope else self.xdrope_positions
             target.gpu[:, :total_num_scheduled_tokens] += drift
 
-        use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+        use_spec_decode = self.speculative_config is not None
         if not use_spec_decode:
             # NOTE(woosuk): Due to chunked prefills, the batch may contain
             # partial requests. While we should not sample any token
@@ -2233,6 +2240,18 @@ class GPUModelRunner(
                 num_draft_tokens[req_idx] = draft_len
                 if num_scheduled_tokens[req_idx] == draft_len + 1:
                     num_decode_draft_tokens[req_idx] = draft_len
+            # Some recurrent backends may read the previous step's state at an
+            # offset that only the speculative path applies. So a decode step
+            # that got no drafts must still count as a speculative row with
+            # zero drafts, not as a plain decode. Prompt chunks are left out:
+            # their tokens are prompt tokens and carry no such offset.
+            zero_draft_decode_mask = (
+                self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                >= self.input_batch.num_prompt_tokens[:num_reqs]
+            ) & (num_scheduled_tokens[:num_reqs] == 1)
+            num_decode_draft_tokens[
+                (num_decode_draft_tokens < 0) & zero_draft_decode_mask
+            ] = 0
             spec_decode_metadata = self._calc_spec_decode_metadata(
                 num_draft_tokens, cu_num_tokens
             )
@@ -3889,6 +3908,7 @@ class GPUModelRunner(
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        force_single_token_decode: bool | None = None,
     ) -> tuple[
         CUDAGraphMode,
         BatchDescriptor,
@@ -3903,6 +3923,28 @@ class GPUModelRunner(
             num_reqs=num_reqs,
             force_uniform_decode=force_uniform_decode,
         )
+        # Speculative decoding steps in which no request has drafts.
+        single_token_decode = self.uniform_decode_query_len > 1 and (
+            self._is_uniform_decode(
+                max_num_scheduled_tokens=max_num_scheduled_tokens,
+                uniform_decode_query_len=1,
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                force_uniform_decode=force_single_token_decode,
+            )
+        )
+        # Under speculative decoding the FULL decode graphs are captured with
+        # every row on the speculative path. A prompt row of the same shape
+        # (draft count -1), such as the last prompt token a P/D decoder
+        # recomputes after a KV load, takes another path in recurrent backends,
+        # so replaying those graphs would use stale recurrent-state indices.
+        if (
+            self.speculative_config is not None
+            and force_uniform_decode is None
+            and force_single_token_decode is None
+            and (self.num_decode_draft_tokens.np[:num_reqs] < 0).any()
+        ):
+            uniform_decode = single_token_decode = False
         # Encoder-decoder models only support CG for decoder_step > 0 (no enc_output
         # is present). Also, chunked-prefill is disabled, so batch are uniform.
         has_encoder_output = (
@@ -3927,6 +3969,7 @@ class GPUModelRunner(
                 num_active_loras=num_active_loras,
                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
+                single_token_decode=single_token_decode,
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
@@ -4280,6 +4323,7 @@ class GPUModelRunner(
                     self.compilation_config.static_forward_context,
                     self.model.get_mamba_state_copy_func(),
                     mamba_bufs.preprocess,
+                    align_ctx=mamba_bufs.postprocess_align,
                 )
                 # preprocess_mamba resets num_accepted_tokens_cpu to 1
                 # for requests whose state was copied to a new block.
@@ -4305,7 +4349,7 @@ class GPUModelRunner(
                         self.mamba_state_idx,
                     )
 
-            use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+            use_spec_decode = self.speculative_config is not None
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
@@ -4834,7 +4878,12 @@ class GPUModelRunner(
         if not self.num_spec_tokens or not self._draft_token_req_ids:
             return None
         draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
-        return DraftTokenIds(req_ids, draft_token_ids)
+        scores = None
+        if isinstance(self.drafter, SuffixDecodingProposer) and isinstance(
+            self._draft_token_ids, list
+        ):
+            scores = self.drafter.last_scores
+        return DraftTokenIds(req_ids, draft_token_ids, scores)
 
     def _copy_draft_token_ids_to_cpu(
         self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
@@ -5778,6 +5827,7 @@ class GPUModelRunner(
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        uniform_query_len: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -5805,6 +5855,8 @@ class GPUModelRunner(
             profile_seq_lens: If provided, use this value for seq_lens instead
                 of max_query_len. Used to profile attention workspace that
                 scales with context length.
+            uniform_query_len: Query length of a uniform decode batch, if not
+                1 + num_speculative_tokens (one-token speculative steps).
         """
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
@@ -5830,7 +5882,14 @@ class GPUModelRunner(
         # When setting max_query_len = 1, we switch to and capture the optimized
         # routine of FA2 for pure decode, i.e., Flashdecode + an optimization
         # for GQA/MQA.
-        max_query_len = self.uniform_decode_query_len if uniform_decode else num_tokens
+        max_query_len = (
+            (uniform_query_len or self.uniform_decode_query_len)
+            if uniform_decode
+            else num_tokens
+        )
+        single_token_capture = uniform_decode and max_query_len == 1 < (
+            self.uniform_decode_query_len
+        )
 
         # Set num_scheduled_tokens based on num_tokens and max_num_seqs
         # for dummy run with LoRA so that the num_reqs collectively
@@ -5882,7 +5941,8 @@ class GPUModelRunner(
                 # capturing mixed prefill-decode batches, we sometimes use
                 # num_tokens == num_reqs which looks like a uniform decode batch to the
                 # dispatcher; but we actually want to capture a piecewise cudagraph
-                force_uniform_decode=uniform_decode,
+                force_uniform_decode=uniform_decode and not single_token_capture,
+                force_single_token_decode=single_token_capture,
                 # `force_has_lora` is used for cudagraph capture; because LoRA is
                 # activated later in the context manager, but we need to know the
                 # LoRA state when determining the batch descriptor for capture
@@ -6231,6 +6291,19 @@ class GPUModelRunner(
                         },
                     ),
                 )
+            # Those compile the Triton top-k/top-p kernel with both filters on
+            # at one batch size; a step may use either filter alone, and Triton
+            # specializes the batch size on multiples of 16, so warm a multiple
+            # of 16 rows as well.
+            top_k, top_p = dummy_metadata.top_k, dummy_metadata.top_p
+            assert top_k is not None and top_p is not None
+            for rows in {num_reqs, num_reqs - 1, num_reqs - num_reqs % 16} - {0}:
+                for k, p in ((top_k, top_p), (top_k, None), (None, top_p)):
+                    apply_top_k_top_p(
+                        logits[:rows].float(),
+                        None if k is None else k[:rows],
+                        None if p is None else p[:rows],
+                    )
         except RuntimeError as e:
             if "out of memory" in str(e):
                 raise RuntimeError(
@@ -6862,6 +6935,15 @@ class GPUModelRunner(
         if num_warmups is None:
             num_warmups = self.compilation_config.cudagraph_num_of_warmups
         force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
+        # One-token decode keys under speculative decoding have one request
+        # per token; 1 + num_speculative_tokens keys have fewer requests.
+        uniform_query_len = (
+            1
+            if desc.uniform
+            and self.uniform_decode_query_len > 1
+            and desc.num_reqs == desc.num_tokens
+            else None
+        )
         for _ in range(num_warmups):
             self._dummy_run(
                 desc.num_tokens,
@@ -6873,6 +6955,7 @@ class GPUModelRunner(
                 remove_lora=False,
                 num_active_loras=desc.num_active_loras,
                 profile_seq_lens=profile_seq_lens,
+                uniform_query_len=uniform_query_len,
             )
         with (
             profiler,
@@ -6890,6 +6973,7 @@ class GPUModelRunner(
                 num_active_loras=desc.num_active_loras,
                 is_graph_capturing=True,
                 profile_seq_lens=profile_seq_lens,
+                uniform_query_len=uniform_query_len,
             )
 
     def _capture_cudagraphs(

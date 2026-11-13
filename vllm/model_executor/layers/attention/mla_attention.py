@@ -1030,9 +1030,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 )
         else:
             # Convert from (L, N, V) to (N, L, V)
-            replace_parameter(self, "W_UV", W_UV.transpose(0, 1), prefer_copy=True)
+            replace_parameter(
+                self, "W_UV", W_UV.transpose(0, 1).contiguous(), prefer_copy=True
+            )
             # Convert from (L, N, P) to (N, P, L)
-            replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0), prefer_copy=True)
+            replace_parameter(
+                self, "W_UK_T", W_UK.permute(1, 2, 0).contiguous(), prefer_copy=True
+            )
 
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]
@@ -1856,6 +1860,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         query_start_loc_cpu: torch.Tensor,
         query_start_loc_device: torch.Tensor,
         num_decode_tokens: int,
+        max_query_len: int,
         dcp_tot_seq_lens_device: torch.Tensor | None,
     ) -> MLACommonDecodeMetadata:
         return MLACommonDecodeMetadata(
@@ -1987,6 +1992,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 query_start_loc_cpu=query_start_loc_cpu[: num_decodes + 1],
                 query_start_loc_device=query_start_loc[: num_decodes + 1],
                 num_decode_tokens=num_decode_tokens,
+                max_query_len=min(
+                    common_attn_metadata.max_query_len, self.reorder_batch_threshold
+                ),
                 dcp_tot_seq_lens_device=dcp_tot_seq_lens_device,
             )
 

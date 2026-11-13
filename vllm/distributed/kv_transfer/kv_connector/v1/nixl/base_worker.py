@@ -4,6 +4,7 @@
 
 import itertools
 import logging
+import math
 import os
 import queue
 import threading
@@ -29,7 +30,10 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
     kv_postprocess_blksize_on_receive,
     kv_postprocess_layout_on_receive,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.base import CopyBlocksOp
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    CopyBlocksOp,
+    KVConnectorTransferResults,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     GET_META_MSG,
@@ -80,9 +84,14 @@ from vllm.v1.worker.utils import select_common_block_size
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.distributed.nixl_utils import nixlXferTelemetry
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
+
+# How long a hold released at its owner's request (`release_hold`) is
+# remembered, so that a reader's notification landing after it reads as late.
+RELEASED_HOLD_GRACE_S = 120.0
 
 
 class NixlBaseConnectorWorker:
@@ -266,6 +275,7 @@ class NixlBaseConnectorWorker:
         )
         # NOTE (NickLucche): For now we use a hardcoded value for a simpler interface.
         self._lease_extension = kv_lease_duration * 2 // 3
+        self._kv_lease_duration = kv_lease_duration
 
         self._bidirectional_kv_xfer_enabled: bool = (
             vllm_config.kv_transfer_config.get_from_extra_config(
@@ -462,6 +472,8 @@ class NixlBaseConnectorWorker:
         self._reqs_to_send: dict[ReqId, float] = {}
         # Set of requests that have been part of a batch, regardless of status.
         self._reqs_to_process: set[ReqId] = set()
+        # When each hold released at its owner's request was let go.
+        self._released_holds: dict[ReqId, float] = {}
 
         # Invalid blocks from failed NIXL operations (thread-safe queue of block ids)
         self._invalid_block_ids: queue.Queue[set[int]] = queue.Queue()
@@ -1945,9 +1957,10 @@ class NixlBaseConnectorWorker:
                 indices=indices,
             )
 
-    def get_finished(self) -> tuple[set[str], set[str]]:
+    def get_transfer_results(self) -> KVConnectorTransferResults:
         """
-        Get requests that are done sending or recving on this specific worker.
+        Get transfers that completed on this specific worker.
+
         The scheduler process (via the MultiprocExecutor) will use this output
         to track which workers are done.
         """
@@ -2025,12 +2038,34 @@ class NixlBaseConnectorWorker:
         self._sync_device_after_mamba_recv(done_recving, failed_recv_reqs)
 
         # Handle timeout to avoid stranding blocks on remote.
+        done_sending |= self._release_lapsed_holds()
+
+        return KVConnectorTransferResults(
+            finished_sending=done_sending,
+            finished_recving=done_recving,
+            failed_recving=failed_recv_reqs,
+        )
+
+    def get_finished(self) -> tuple[set[str], set[str]]:
+        """The finished sends and receives of `get_transfer_results`."""
+        results = self.get_transfer_results()
+        return results.finished_sending, results.finished_recving
+
+    def _release_lapsed_holds(self) -> set[ReqId]:
+        """Let go the holds whose lease ran out or that their owner released.
+
+        `release_hold` sets a hold to expire at 0; those are remembered for
+        `RELEASED_HOLD_GRACE_S`. Every entry is checked, since heartbeats and
+        released holds reorder the deadlines.
+        """
         now = time.perf_counter()
-        while self._reqs_to_send:
-            req_id, expires = next(iter(self._reqs_to_send.items()))
-            # Sorted dict, oldest requests are put first so we can exit early.
+        for req_id, at in list(self._released_holds.items()):
+            if now - at > RELEASED_HOLD_GRACE_S:
+                del self._released_holds[req_id]
+        released = set[ReqId]()
+        for req_id, expires in list(self._reqs_to_send.items()):
             if now < expires:
-                break
+                continue
             count = self.consumer_notification_counts_by_req.pop(req_id, 0)
             self.xfer_stats.record_kv_expired_req()
             logger.warning(
@@ -2039,11 +2074,12 @@ class NixlBaseConnectorWorker:
                 req_id,
                 count,
             )
+            if expires <= 0.0:
+                self._released_holds[req_id] = now
             self._reqs_to_process.remove(req_id)
             del self._reqs_to_send[req_id]
-            done_sending.add(req_id)
-
-        return done_sending, done_recving
+            released.add(req_id)
+        return released
 
     def _sync_device_after_mamba_recv(
         self,
@@ -2067,6 +2103,39 @@ class NixlBaseConnectorWorker:
         Subclasses must implement this to handle mode-specific notifications.
         """
         raise NotImplementedError
+
+    def _lease_left_s(self, meta: ReqMeta) -> float:
+        """Seconds on this clock until the remote may release the request's blocks.
+
+        Inf if it exported no expiry, -inf if its clock is unknown. Only the
+        expiry the remote exported counts: heartbeats ask it for more time, but
+        nothing confirms that it granted it.
+        """
+        assert meta.remote is not None
+        expiry = meta.remote.blocks_expiry_time
+        # The router may not forward the expiry: assume the lease holds.
+        if expiry is None:
+            return math.inf
+        offset = self._engine_clock_offset.get(meta.remote.engine_id)
+        if offset is None:
+            return -math.inf  # The engine was evicted meanwhile.
+        return expiry - offset - time.perf_counter()
+
+    def _lease_s(self, meta: ReqMeta) -> float:
+        """The remote's lease duration, or ours if it exported none."""
+        assert meta.remote is not None
+        return meta.remote.blocks_lease_duration or self._kv_lease_duration
+
+    def _is_lease_expired(self, meta: ReqMeta) -> bool:
+        """Whether the remote may release the blocks before a transfer completes.
+
+        If so, they must not be transferred.
+        """
+        left = self._lease_left_s(meta)
+        if left == math.inf:
+            return False
+        # Slack for clock-offset error and transfer latency.
+        return left <= min(5.0, self._lease_s(meta) / 4)
 
     def _handle_heartbeat(self, payload: str) -> None:
         """Extend leases for requests referenced in a heartbeat.
@@ -2106,7 +2175,7 @@ class NixlBaseConnectorWorker:
                     if xfer_state == "DONE":
                         # Get telemetry from NIXL
                         res = self.nixl_wrapper.get_xfer_telemetry(handle)
-                        self.xfer_stats.record_transfer(res)
+                        self._record_transfer(req_id, res)
                         self.nixl_wrapper.release_xfer_handle(handle)
                     elif xfer_state == "PROC":
                         in_progress.append(handle)
@@ -2136,6 +2205,10 @@ class NixlBaseConnectorWorker:
                 transfers[req_id] = in_progress
         return done_req_ids
 
+    def _record_transfer(self, req_id: str, res: "nixlXferTelemetry") -> None:
+        """Record the telemetry of one of `req_id`'s completed transfers."""
+        self.xfer_stats.record_transfer(res)
+
     def _handle_failed_transfer(self, req_id: str, handle: int | None):
         """
         Handle a failed transfer by marking all (logical) blocks as invalid and
@@ -2145,8 +2218,9 @@ class NixlBaseConnectorWorker:
             req_id: The request ID.
             handle: The transfer handle.
         """
-        # Use .get() here as the metadata cleanup is handled by get_finished()
-        # TODO (NickLucche) handle failed transfer for HMA.
+        # Use .get() here as the metadata cleanup is handled by get_finished().
+        # Hybrid block ids are per group, so HMA reports only the request via
+        # failed_recving.
         if (meta := self._recving_metadata.get(req_id)) and not self._is_hma_required:
             self._invalid_block_ids.put(set(meta.local_block_ids[0]))
         self._failed_recv_reqs.put(req_id)
@@ -2282,16 +2356,25 @@ class NixlBaseConnectorWorker:
             for i, remote_group in enumerate(remote_block_ids):
                 num_local_blocks = len(local_block_ids[i])
                 num_remote_blocks = len(remote_group)
-                if (
-                    _is_ssm_spec(self._group_spec_types[i])
-                    and num_local_blocks < num_remote_blocks
-                ):
-                    # NOTE (NickLucche): With prefix caching on SSM, (remote) blocks
-                    # prior to the last one are placeholders (null blocks). Mind that
-                    # this doesn't really impact transfer, as we only still care about
-                    # the last "block", the full in-place state.
-                    assert num_local_blocks == 1, "SSM can only have one local block"
-                    remote_block_ids[i] = remote_group[-num_local_blocks:]
+                if _is_ssm_spec(self._group_spec_types[i]):
+                    if num_local_blocks == num_remote_blocks:
+                        continue
+                    # Only state-bearing slots reach here, single-state modes
+                    # just one (see get_exchange_clipped_blocks), so differing
+                    # counts mean position-indexed "all"-mode lists. A longer
+                    # remote list carries earlier positions the local side
+                    # already has (prefix hit) -> read its tail; a longer local
+                    # list holds the position D recomputes itself, which gets
+                    # no remote state.
+                    assert num_local_blocks - num_remote_blocks <= 1, (
+                        f"Group {i}: unpairable SSM state slots, "
+                        f"local={num_local_blocks} remote={num_remote_blocks}"
+                    )
+                    num_blocks = min(num_local_blocks, num_remote_blocks)
+                    if num_local_blocks < num_remote_blocks:
+                        remote_block_ids[i] = remote_group[-num_blocks:]
+                    else:
+                        local_block_ids[i] = local_block_ids[i][:num_blocks]
                 elif (
                     self._physical_blocks_per_logical_kv_block
                     == remote_physical_per_logical

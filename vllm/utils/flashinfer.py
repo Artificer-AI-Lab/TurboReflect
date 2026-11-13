@@ -513,6 +513,69 @@ def use_trtllm_attention(
     return True
 
 
+@functools.cache
+def _bmm_fp8_auto_skips_cudnn() -> bool:
+    """Whether `bmm_fp8(backend="auto")` must leave cuDNN out here.
+
+    On SM12x without cuDNN's override_shape (cuDNN backend < 9.23.1) the cuDNN
+    FP8 GEMM faults asynchronously at a later sync, and its autotuner may pick
+    it for any shape and persist that choice. False where the installed
+    FlashInfer gates cuDNN itself, as 0.6.18 does (flashinfer-ai/flashinfer#4165).
+    """
+    from flashinfer.gemm import gemm_base
+
+    if hasattr(gemm_base, "_CUDNN_SM12X_SKIP_LOGGED"):
+        return False
+    skip = (
+        current_platform.is_device_capability_family(120)
+        and gemm_base.CUDNN_AVAILABLE
+        and not gemm_base._is_cudnn_override_shape_available()
+    )
+    if skip:
+        logger.warning_once(
+            "Skipping cuDNN in FlashInfer bmm_fp8 auto candidates on SM12x: "
+            "cuDNN override_shape unavailable (backend < 9.23.1), so its FP8 "
+            "GEMM can fault (FlashInfer #4165)."
+        )
+    return skip
+
+
+def _flashinfer_bmm_fp8(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    dtype: torch.dtype,
+    out: torch.Tensor | None,
+    backend: str,
+) -> torch.Tensor:
+    """FlashInfer's `bmm_fp8`, with the SM12x cuDNN gate on "auto".
+
+    The gated path is FlashInfer 0.6.16.post3's own "auto" path (problem-size
+    check, workspace, `fp8_gemm_sm100` autotuning) over the candidates its
+    heuristic keeps from CUTLASS and cuBLAS.
+    """
+    if backend != "auto" or not _bmm_fp8_auto_skips_cudnn():
+        from flashinfer import bmm_fp8 as bmm_fp8_
+
+        return bmm_fp8_(A, B, A_scale, B_scale, dtype, out, backend)
+    from flashinfer.gemm import gemm_base
+
+    if out is None:
+        out = torch.empty(
+            (A.shape[0], A.shape[1], B.shape[2]), device=A.device, dtype=dtype
+        )
+    gemm_base._check_bmm_fp8_problem_size(A, B, A_scale, B_scale, dtype, out, backend)
+    backends = gemm_base._heuristic_func_bmm_fp8(
+        ["cutlass", "cublas"], A, B, A_scale, B_scale, dtype, out, backend
+    )
+    workspace = gemm_base._get_cache_buf(
+        "bmm_fp8_workspace", gemm_base.DEFAULT_WORKSPACE_SIZE, A.device
+    )
+    gemm_base.fp8_gemm_sm100(A, B, A_scale, B_scale, out, workspace, backends)
+    return out
+
+
 if has_flashinfer():
     from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -651,9 +714,7 @@ if has_flashinfer():
         dtype: torch.dtype,
         backend: str,
     ) -> torch.Tensor:
-        from flashinfer import bmm_fp8 as bmm_fp8_
-
-        return bmm_fp8_(A, B, A_scale, B_scale, dtype, None, backend)
+        return _flashinfer_bmm_fp8(A, B, A_scale, B_scale, dtype, None, backend)
 
     @torch.library.register_fake(
         "vllm::bmm_fp8",
@@ -907,9 +968,7 @@ def flashinfer_scaled_fp8_mm_out(
     assert out.device.type == "cuda"
     assert a.is_contiguous()
 
-    from flashinfer import bmm_fp8 as bmm_fp8_
-
-    bmm_fp8_(
+    _flashinfer_bmm_fp8(
         a.unsqueeze(0),
         # FlashInfer expects the weight in the same column-major view layout
         # consumed by flashinfer_scaled_fp8_mm, so keep the transposed view.

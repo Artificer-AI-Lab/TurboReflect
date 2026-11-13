@@ -467,6 +467,43 @@ def _fwd_grouped_kernel_stage1(
         )
 
 
+# A GPU needs roughly 132KB of opt-in shared memory per block to run the grouped
+# stage-1 kernel double-buffered at BLOCK_DMODEL=512. Devices with 227KB are
+# unaffected; on devices capped at 99KB num_stages=2 asks for 102400 > 101376
+# bytes and Triton raises OutOfResources.
+_SMEM_DOUBLE_BUFFER_BYTES = 132 * 1024
+
+
+def _smem_per_block_opt_in(device) -> int:
+    """Opt-in shared memory per block, or a large value off CUDA.
+
+    Returns a value above the threshold when the property is unavailable so the
+    gate stays a no-op rather than silently degrading a healthy GPU.
+    """
+    try:
+        return torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+    except Exception:
+        return _SMEM_DOUBLE_BUFFER_BYTES
+
+
+def stage1_num_stages(block_dmodel: int, smem_per_block_opt_in: int) -> int:
+    """Pipeline depth for `_fwd_grouped_kernel_stage1` on NVIDIA.
+
+    Args:
+        block_dmodel: The kernel's ``BLOCK_DMODEL`` constexpr.
+        smem_per_block_opt_in: The device's opt-in shared memory per block, bytes.
+
+    Returns:
+        1 when double buffering would overflow shared memory, else 2.
+    """
+    if block_dmodel >= 1024:
+        # Non-MLA D_QK=576 rounds up to 1024, which overflows even a 227KB GPU.
+        return 1
+    if block_dmodel >= 512 and smem_per_block_opt_in < _SMEM_DOUBLE_BUFFER_BYTES:
+        return 1
+    return 2
+
+
 def _decode_grouped_att_m_fwd(
     q,
     k_buffer,
@@ -519,17 +556,13 @@ def _decode_grouped_att_m_fwd(
     )
 
     extra_kargs = {}
-    num_stages = 2
     if is_hip_:
         # https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/workload.html#mi300x-triton-kernel-performance-optimization
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
         num_stages = 1
-    elif not is_hip_ and BLOCK_DMODEL >= 1024:
-        # Avoid shared memory overflow on NVIDIA when BLOCK_DMODEL is large
-        # like non-MLA D_QK=576, BLOCK_DMODEL=1024, BLOCK_H=16
-        # exceeds 101376 bytes limit
-        num_stages = 1
+    else:
+        num_stages = stage1_num_stages(BLOCK_DMODEL, _smem_per_block_opt_in(q.device))
 
     _fwd_grouped_kernel_stage1[grid](
         q,
@@ -816,3 +849,327 @@ def decode_attention_fwd(
             v_scale,
             is_mla=is_mla,
         )
+
+
+@triton.jit
+def _fwd_verify_kernel_stage1(
+    Q,
+    K_Buffer,
+    sm_scale,
+    Req_to_tokens,
+    Row_req,
+    Causal_len,
+    Split_len,
+    Query_tiles,
+    Att_Out,
+    stride_req_to_tokens_b,
+    stride_qbs,
+    stride_qh,
+    stride_buf_kpbs,
+    stride_buf_kbs,
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
+    k_scale,
+    q_head_num: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DPE: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    logit_cap: tl.constexpr,
+    Lk: tl.constexpr,
+    Lv: tl.constexpr,
+    GROUPED: tl.constexpr,
+    FOLD_K_SCALE: tl.constexpr,
+):
+    """MLA stage1 over causal verify rows (one row per query token).
+
+    Rowwise (GROUPED=0): program = (row, head tile, split), as in
+    `_fwd_grouped_kernel_stage1`, with the row's block-table row read through
+    `Row_req` and its partition taken from `Split_len`.
+    Grouped (GROUPED=1): program = (query tile, -, split). A tile holds
+    BLOCK_H flattened rows ``j * q_head_num + h`` of one request, possibly
+    spanning queries; each KV block is loaded once for the tile and every row is
+    masked at its own causal length. The partition is the request's final
+    length. Rows whose causal extent misses a non-empty split store a zero
+    output and a -inf LSE, which stage2 merges as an empty split.
+    FOLD_K_SCALE feeds FP8 K tiles to the dots unscaled so they stay FP8 in
+    shared memory; scaling each tile first makes Triton stage separate bf16
+    copies for QK and PV, 102400 B at BLOCK_H=32 (sm_120 allows 101376).
+    """
+    split_kv_id = tl.program_id(2)
+    if GROUPED:
+        tile = tl.program_id(0)
+        first_row = tl.load(Query_tiles + tile * 4)
+        flat = tl.load(Query_tiles + tile * 4 + 1) + tl.arange(0, BLOCK_H)
+        n_queries = tl.load(Query_tiles + tile * 4 + 2)
+        split_len = tl.load(Query_tiles + tile * 4 + 3)
+        row = first_row + flat // q_head_num
+        head = flat % q_head_num
+        mask_h = flat < n_queries * q_head_num
+        causal_len = tl.load(Causal_len + row, mask=mask_h, other=0)
+        kv_limit = tl.max(causal_len, 0)
+        req_row = first_row
+    else:
+        row = tl.program_id(0)
+        head = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+        mask_h = head < q_head_num
+        split_len = tl.load(Split_len + row)
+        kv_limit = tl.load(Causal_len + row)
+        req_row = row
+
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    mask_d = offs_d < Lk
+    mask_dv = offs_dv < Lv
+    q_base = row * stride_qbs + head * stride_qh
+    out_base = row * stride_mid_ob + head * stride_mid_oh
+
+    q = tl.load(
+        Q + q_base[:, None] + offs_d[None, :],
+        mask=(mask_h[:, None]) & (mask_d[None, :]),
+        other=0.0,
+        cache_modifier=".ca",
+    )
+    if BLOCK_DPE > 0:
+        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+        mask_dpe = offs_dpe < Lk
+        qpe = tl.load(
+            Q + q_base[:, None] + offs_dpe[None, :],
+            mask=(mask_h[:, None]) & (mask_dpe[None, :]),
+            other=0.0,
+            cache_modifier=".ca",
+        )
+
+    kv_len_per_split = tl.cdiv(split_len, NUM_KV_SPLITS)
+    split_kv_start = kv_len_per_split * split_kv_id
+    split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, split_len)
+    kv_end = tl.minimum(split_kv_end, kv_limit)
+
+    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
+    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
+
+    if split_kv_end > split_kv_start:
+        req = tl.load(Row_req + req_row)
+        base_offs_k = offs_d[:, None]
+        if BLOCK_DPE > 0:
+            base_offs_kpe = offs_dpe[:, None]
+
+        ks = tl.load(k_scale)
+        qk_scale = sm_scale * ks if FOLD_K_SCALE else sm_scale
+        for start_n in tl.range(split_kv_start, kv_end, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            kv_page_number = tl.load(
+                Req_to_tokens + stride_req_to_tokens_b * req + offs_n // PAGE_SIZE,
+                mask=offs_n < kv_end,
+                other=0,
+                cache_modifier=".ca",
+            ).to(tl.int64)  # page_number * page stride overflows int32
+            kv_off_k = (
+                kv_page_number * stride_buf_kpbs + (offs_n % PAGE_SIZE) * stride_buf_kbs
+            )
+
+            offs_buf_k = kv_off_k[None, :] + base_offs_k
+            k = tl.load(
+                K_Buffer + offs_buf_k,
+                mask=(offs_n[None, :] < kv_end) & (mask_d[:, None]),
+                other=0.0,
+                cache_modifier=".cg",
+            )
+            if not FOLD_K_SCALE and k.dtype.is_fp8():
+                k = (k.to(tl.float32) * ks).to(q.dtype)
+            k = k.to(q.dtype)
+            qk = tl.dot(q, k)
+            if BLOCK_DPE > 0:
+                offs_buf_kpe = kv_off_k[None, :] + base_offs_kpe
+                kpe = tl.load(
+                    K_Buffer + offs_buf_kpe,
+                    mask=(offs_n[None, :] < kv_end) & (mask_dpe[:, None]),
+                    other=0.0,
+                    cache_modifier=".cg",
+                )
+                if not FOLD_K_SCALE and kpe.dtype.is_fp8():
+                    kpe = (kpe.to(tl.float32) * ks).to(qpe.dtype)
+                qk += tl.dot(qpe, kpe.to(qpe.dtype))
+            qk *= qk_scale
+
+            if logit_cap > 0:
+                qk = logit_cap * tanh(qk / logit_cap)
+
+            visible = mask_h[:, None] & (offs_n[None, :] < kv_end)
+            if GROUPED:
+                visible = visible & (offs_n[None, :] < causal_len[:, None])
+            qk = tl.where(visible, qk, float("-inf"))
+
+            # MLA: the latent K block is also V.
+            v = tl.trans(k)
+
+            n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+            # A grouped row can see none of a block; keep its exponent finite.
+            m_i = tl.where(n_e_max == float("-inf"), 0.0, n_e_max)
+            re_scale = tl.exp(e_max - m_i)
+            p = tl.exp(qk - m_i[:, None])
+            acc *= re_scale[:, None]
+            acc += tl.dot(p.to(v.dtype), v)
+
+            e_sum = e_sum * re_scale + tl.sum(p, 1)
+            e_max = n_e_max
+
+        offs_mid_o = out_base + split_kv_id * stride_mid_os
+        if FOLD_K_SCALE:
+            acc *= ks
+        tl.store(
+            Att_Out + offs_mid_o[:, None] + offs_dv[None, :],
+            acc / tl.where(e_sum > 0, e_sum, 1.0)[:, None],
+            mask=(mask_h[:, None]) & (mask_dv[None, :]),
+        )
+        tl.store(
+            Att_Out + offs_mid_o + Lv,
+            e_max + tl.log(e_sum),
+            mask=mask_h,
+        )
+
+
+def _is_fp8_cache(k_buffer: torch.Tensor) -> bool:
+    return k_buffer.dtype.is_floating_point and k_buffer.element_size() == 1
+
+
+def _mla_block_dims(Lk: int, Lv: int) -> tuple[int, int]:
+    if not is_hip_ and Lk == 576:
+        return 512, 64
+    if not is_hip_ and Lk == 288:
+        return 256, 32
+    return triton.next_power_of_2(Lv), (
+        triton.next_power_of_2(Lk - Lv) if Lk > Lv else 0
+    )
+
+
+def decode_attention_fwd_verify(
+    q,
+    k_buffer,
+    v_buffer,
+    o,
+    lse,
+    req_to_token,
+    row_req,
+    causal_lens,
+    split_lens,
+    attn_logits,
+    num_kv_splits,
+    sm_scale,
+    page_size,
+    k_scale,
+    query_tiles=None,
+    num_query_tiles=0,
+    block_h=16,
+    num_warps=None,
+    num_stages=None,
+    logit_cap=0.0,
+    fold_k_scale=None,
+):
+    """MLA decode over causal verify rows.
+
+    Args:
+        q: ``[rows, heads, Lk]`` queries, one row per query token.
+        k_buffer: Paged latent+rope cache ``[..., PAGE_SIZE, 1, Lk]``.
+        v_buffer: Latent view of the same cache (``Lv`` = latent rank).
+        o: ``[rows, heads, Lv]`` output.
+        lse: ``[rows, heads]`` output log-sum-exp.
+        req_to_token: Per-request block table (not expanded per row).
+        row_req: ``[rows]`` block-table row of each query row.
+        causal_lens: ``[rows]`` KV extent visible to each row; 0 for padding.
+        split_lens: ``[rows]`` length whose ``num_kv_splits`` partition both
+            stages use; 0 for padding rows.
+        attn_logits: ``[rows, heads, num_kv_splits, Lv + 1]`` fp32 scratch.
+        num_kv_splits: Number of KV splits.
+        sm_scale: Softmax scale.
+        page_size: KV cache page size.
+        k_scale: Device scalar latent scale (read for FP8 caches only).
+        query_tiles: ``[>= num_query_tiles, 4]`` int32 grouped tiles
+            ``(first row, flattened row offset, query count, final length)``;
+            ``None`` for rowwise execution.
+        num_query_tiles: Grid size for grouped execution; tiles with a zero
+            query count are skipped.
+        block_h: Query rows per program (heads for rowwise, flattened
+            query/head rows for grouped).
+        num_warps: Defaults to 4, as in native grouped decode, for any
+            ``block_h``.
+        num_stages: Defaults to the native stage1 pipeline depth.
+        logit_cap: Soft cap on attention logits (0 disables).
+        fold_k_scale: Apply an FP8 cache's ``k_scale`` to the logits and the
+            output instead of each K tile. Defaults to on for FP8 caches on
+            GPUs below ``_SMEM_DOUBLE_BUFFER_BYTES`` of opt-in shared memory.
+    """
+    Lk = k_buffer.shape[-1]
+    Lv = v_buffer.shape[-1]
+    assert num_kv_splits == attn_logits.shape[2]
+    assert k_buffer.shape[-2] == 1, "verify rows are MLA-only (one latent head)"
+    BLOCK_DMODEL, BLOCK_DPE = _mla_block_dims(Lk, Lv)
+    BLOCK_DV = triton.next_power_of_2(Lv)
+    BLOCK = 16 if is_hip_ else 32
+
+    rows, head_num = q.shape[0], q.shape[1]
+    if rows == 0:
+        return
+    grouped = query_tiles is not None
+    if grouped:
+        grid = (num_query_tiles, 1, num_kv_splits)
+    else:
+        grid = (rows, triton.cdiv(head_num, block_h), num_kv_splits)
+        query_tiles = row_req
+
+    extra_kargs = {}
+    small_smem = False
+    if is_hip_:
+        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+        default_stages = 1
+    else:
+        smem = _smem_per_block_opt_in(q.device)
+        small_smem = smem < _SMEM_DOUBLE_BUFFER_BYTES
+        default_stages = stage1_num_stages(BLOCK_DMODEL, smem)
+    if fold_k_scale is None:
+        fold_k_scale = small_smem and _is_fp8_cache(k_buffer)
+    if grid[0]:
+        _fwd_verify_kernel_stage1[grid](
+            q,
+            k_buffer,
+            sm_scale,
+            req_to_token,
+            row_req,
+            causal_lens,
+            split_lens,
+            query_tiles,
+            attn_logits,
+            req_to_token.stride(0),
+            q.stride(0),
+            q.stride(1),
+            _page_stride(k_buffer, page_size),
+            k_buffer.stride(-3),
+            attn_logits.stride(0),
+            attn_logits.stride(1),
+            attn_logits.stride(2),
+            k_scale,
+            q_head_num=head_num,
+            BLOCK_DMODEL=BLOCK_DMODEL,
+            BLOCK_DPE=BLOCK_DPE,
+            BLOCK_DV=BLOCK_DV,
+            BLOCK_N=BLOCK,
+            BLOCK_H=block_h,
+            NUM_KV_SPLITS=num_kv_splits,
+            PAGE_SIZE=page_size,
+            logit_cap=logit_cap,
+            Lk=Lk,
+            Lv=Lv,
+            GROUPED=grouped,
+            FOLD_K_SCALE=fold_k_scale,
+            num_warps=num_warps or 4,
+            num_stages=num_stages or default_stages,
+            **extra_kargs,
+        )
+    _decode_softmax_reducev_fwd(
+        attn_logits, q, o, lse, v_buffer, split_lens, num_kv_splits
+    )

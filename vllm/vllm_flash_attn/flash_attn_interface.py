@@ -78,10 +78,12 @@ def _is_fa4_supported() -> tuple[bool, str | None]:
         current_platform.is_device_capability_family(90)
         or current_platform.is_device_capability_family(100)
         or current_platform.is_device_capability_family(110)
+        or current_platform.is_device_capability_family(120)
     ):
         return (
             False,
-            "FA4 is only supported on devices with compute capability 9.x, 10.x, or 11.x",
+            "FA4 is only supported on devices with compute capability 9.x, 10.x, "
+            "11.x, or 12.x",
         )
     return True, None
 
@@ -386,7 +388,16 @@ def flash_attn_varlen_func(
     elif fa_version == 4:
         assert alibi_slopes is None, "Alibi is not supported in FA4"
 
+        from vllm.platforms import current_platform
         from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
+
+        # SM120's forward kernel runs one split, and its default 128x64 tile
+        # overflows the 99 KB of shared memory at head_dim 256; 64x64 fits and
+        # is the faster tile at head_dim 128 as well.
+        sm120_kwargs = {}
+        if current_platform.is_device_capability_family(120):
+            sm120_kwargs = {"tile_mn": (64, 64)}
+            num_splits = 1
 
         out, softmax_lse, _, _ = _flash_attn_fwd(
             q,
@@ -411,6 +422,7 @@ def flash_attn_varlen_func(
             mask_mod=mask_mod,
             aux_tensors=aux_tensors,
             output_scale=output_scale,
+            **sm120_kwargs,
         )
     else:
         raise ValueError(f"Unsupported FA version: {fa_version}")

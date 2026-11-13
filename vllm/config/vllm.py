@@ -1748,9 +1748,10 @@ class VllmConfig:
         cudagraph_capture_sizes = [1, 2, 4] + list(range(8, 256, 8)) + list(
             range(256, max_graph_size + 1, 16))
 
-        `max_num_batched_tokens` is also appended to the list if it fits
-        within `max_cudagraph_capture_size`, so the max batch size is captured
-        even when off-stride.
+        `max_num_batched_tokens` and the full decode batch
+        (`max_num_seqs * (1 + num_speculative_tokens)`) are also appended to
+        the list if they fit within `max_cudagraph_capture_size`, so both are
+        captured even when off-stride.
 
         In the end, `vllm_config.compilation_config.cudagraph_capture_sizes`
         will be the final sizes to capture cudagraph (in ascending order).
@@ -1789,8 +1790,8 @@ class VllmConfig:
             max_cudagraph_capture_size = (
                 self.compilation_config.max_cudagraph_capture_size
             )
+            decode_query_len = 1 + self.num_speculative_tokens
             if max_cudagraph_capture_size is None:
-                decode_query_len = 1 + self.num_speculative_tokens
                 max_cudagraph_capture_size = min(
                     self.scheduler_config.max_num_seqs * decode_query_len * 2, 512
                 )
@@ -1841,6 +1842,12 @@ class VllmConfig:
                     and max_num_tokens not in cudagraph_capture_sizes
                 ):
                     cudagraph_capture_sizes.append(max_num_tokens)
+                # FULL decode graphs need a size <= the full decode batch
+                max_decode_tokens = (
+                    self.scheduler_config.max_num_seqs * decode_query_len
+                )
+                if max_decode_tokens <= max_cudagraph_capture_size:
+                    cudagraph_capture_sizes.append(max_decode_tokens)
                 # de-duplicate and sort the sizes
                 cudagraph_capture_sizes = sorted(set(cudagraph_capture_sizes))
 

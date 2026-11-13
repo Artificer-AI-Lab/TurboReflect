@@ -50,6 +50,7 @@ from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_configs,
     get_request_block_hasher,
     init_none_hash,
+    kv_pool_layout,
     resolve_kv_cache_block_sizes,
 )
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
@@ -134,6 +135,7 @@ class EngineCore:
 
         # Setup KV Caches and update CacheConfig after profiling.
         kv_cache_config = self._initialize_kv_caches(vllm_config)
+        self._kv_pool_layout = kv_pool_layout(kv_cache_config)
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
         # Setup scheduler.
@@ -427,6 +429,38 @@ class EngineCore:
                 }
             )
         return metadata
+
+    def get_kv_pool_layout(self) -> dict[str, int]:
+        """The pool's blocks per sequence (`kv_pool_layout`)."""
+        return self._kv_pool_layout
+
+    def get_locality_pd_scheduler_state(self) -> dict[str, Any]:
+        """Read locality-aware P/D state only from a scheduler that implements it."""
+        getter = getattr(self.scheduler, "get_locality_pd_state", None)
+        if not callable(getter):
+            raise RuntimeError(
+                "this engine is not running the locality-aware P/D worker scheduler"
+            )
+        state = getter()
+        if not isinstance(state, dict):
+            raise TypeError("locality-aware P/D scheduler state must be a dictionary")
+        return state
+
+    def release_kv_hold(self, request_id: str) -> bool:
+        """Free a finished request's blocks held for a KV pull no one will make.
+
+        Returns whether the request was still held; False also when the
+        engine's connector has no holds to release.
+        """
+        release = getattr(
+            getattr(self.scheduler, "connector", None), "release_hold", None
+        )
+        requests = getattr(self.scheduler, "requests", {})
+        request = requests.get(request_id)
+        if request is None or not request.is_finished() or not callable(release):
+            return False
+        release(request_id)
+        return True
 
     def add_request(self, request: Request, request_wave: int = 0):
         """Add request to the scheduler.

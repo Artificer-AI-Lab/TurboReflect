@@ -1244,6 +1244,20 @@ class MambaManager(SingleTypeKVCacheManager):
             self.last_state_block_idx: dict[str, int] = {}
             # The set of the requests that have been allocated blocks
             self._allocated_block_reqs: set[str] = set()
+            # Reusable state blocks referenced on each running request's
+            # behalf until it is freed (see ``_retain_boundary_block``): the
+            # prompt boundary, the boundary one block before it, the state
+            # loaded from the cache, and the deepest boundary past the prompt.
+            self._boundary_blocks: dict[str, KVCacheBlock] = {}
+            self._prev_boundary_blocks: dict[str, KVCacheBlock] = {}
+            self._hit_blocks: dict[str, KVCacheBlock] = {}
+            self._output_boundary_blocks: dict[str, KVCacheBlock] = {}
+            self._holds = (
+                self._boundary_blocks,
+                self._prev_boundary_blocks,
+                self._hit_blocks,
+                self._output_boundary_blocks,
+            )
 
     @classmethod
     def find_longest_cache_hit(
@@ -1389,6 +1403,15 @@ class MambaManager(SingleTypeKVCacheManager):
     ) -> None:
         assert isinstance(self.kv_cache_spec, MambaSpec)
 
+        if self.mamba_cache_mode == "align" and self.enable_caching:
+            # A spec-decode step can accept tokens past a block boundary
+            # without stopping on it; the worker saves the boundary state in
+            # that block, which only this step's ``cache_blocks`` hashes.
+            # Retire no block that ``cache_blocks`` has not reached yet.
+            num_cached_blocks = self.num_cached_block.get(request_id, 0)
+            processed_computed_tokens = min(
+                processed_computed_tokens, num_cached_blocks * self.block_size + 1
+            )
         super().remove_skipped_blocks(
             request_id, processed_computed_tokens, num_prompt_tokens
         )
@@ -1590,6 +1613,13 @@ class MambaManager(SingleTypeKVCacheManager):
                         self.block_pool.move_block_hashes(source_block, cow_block)
                         self._pending_cow_copies.append((source_block, cow_block))
                         source_block.ref_cnt += 1
+                        for holds in self._holds:
+                            if holds.get(request_id) is source_block:
+                                # The boundary state moves to cow_block with
+                                # its hash; move the request's hold as well.
+                                source_block.ref_cnt -= 1
+                                cow_block.ref_cnt += 1
+                                holds[request_id] = cow_block
                         if cow_block.block_hash is not None:
                             # The moved entry is only filled by this step's
                             # copy, so defer same-step hits on it.
@@ -1604,10 +1634,27 @@ class MambaManager(SingleTypeKVCacheManager):
                 return returned_blocks
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
-        if self.mamba_cache_mode == "align":
-            self._allocated_block_reqs.discard(request_id)
-            self.last_state_block_idx.pop(request_id, None)
-        return super().pop_blocks_for_free(request_id)
+        if self.mamba_cache_mode != "align":
+            return super().pop_blocks_for_free(request_id)
+        self._allocated_block_reqs.discard(request_id)
+        self.last_state_block_idx.pop(request_id, None)
+        held = [
+            block
+            for holds in self._holds
+            if (block := holds.pop(request_id, None)) is not None
+        ]
+        blocks = super().pop_blocks_for_free(request_id)
+        retired: list[KVCacheBlock] = []
+        for block in held:
+            if any(b is block for b in blocks):
+                # Its table entry frees it, so the hold is not the last
+                # reference: just drop it.
+                block.ref_cnt -= 1
+            else:
+                retired.append(block)
+        # Callers free in reverse order: list the retired states first so the
+        # reusable states are the last of the request's blocks to be freed.
+        return [*retired, *blocks]
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
@@ -1630,6 +1677,8 @@ class MambaManager(SingleTypeKVCacheManager):
             partial_hash = self._cache_partial_tail_block(request, num_tokens)
             if partial_hash is not None:
                 self.cached_blocks_this_step.add(partial_hash)
+            if request.request_id in self._hit_blocks:
+                self._retain_hit_boundaries(request, num_cached_blocks_before)
         if num_cached_blocks_after > num_cached_blocks_before:
             for block in self.req_to_blocks[request.request_id][
                 num_cached_blocks_before:num_cached_blocks_after
@@ -1641,9 +1690,179 @@ class MambaManager(SingleTypeKVCacheManager):
                 if block.is_null or block.block_hash is None:
                     continue
                 self.cached_blocks_this_step.add(block.block_hash)
+            if self.mamba_cache_mode == "align":
+                self._retain_new_boundaries(
+                    request, num_cached_blocks_before, num_cached_blocks_after
+                )
 
     def new_step_starts(self) -> None:
         self.cached_blocks_this_step.clear()
+
+    def add_local_computed_blocks(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        super().add_local_computed_blocks(
+            request_id,
+            new_computed_blocks,
+            num_local_computed_tokens,
+            num_external_computed_tokens,
+        )
+        if self.mamba_cache_mode != "align" or not new_computed_blocks:
+            return
+        # A resumed or later-stage request takes over a cached state it never
+        # registers itself. Hold it until the request is freed: a successor
+        # diverging before the request's own boundaries resumes from it.
+        hit_block = new_computed_blocks[-1]
+        req_blocks = self.req_to_blocks[request_id]
+        if (
+            req_blocks
+            and req_blocks[-1] is hit_block
+            and not hit_block.is_null
+            and hit_block.block_hash is not None
+        ):
+            self._retain_boundary_block(self._hit_blocks, request_id, hit_block)
+
+    def takes_external_boundary_state(
+        self, boundary_tokens: int, num_computed_tokens: int
+    ) -> bool:
+        """Whether a pending external load needs a block for its boundary state.
+
+        The load covers `num_computed_tokens` and also writes the state at
+        `boundary_tokens`. Only in align mode with caching, and only for the
+        last block boundary strictly inside the load: the one a local prefill of
+        that prefix stops on and caches (`_retain_new_boundaries`). A load
+        ending on a boundary leaves its running state there, which the table
+        already caches.
+        """
+        return (
+            self.mamba_cache_mode == "align"
+            and self.enable_caching
+            and boundary_tokens > 0
+            and num_computed_tokens % self.block_size != 0
+            and boundary_tokens
+            == num_computed_tokens // self.block_size * self.block_size
+        )
+
+    def add_external_boundary_block(
+        self, request_id: str, boundary_tokens: int
+    ) -> None:
+        """Back a pending external load's boundary state with a block.
+
+        Run after `allocate_external_computed_blocks`, which leaves the table
+        as nulls up to the running state. The block at the boundary takes the
+        state the connector writes there; it is left out of the cached count,
+        so the `cache_blocks` that follows the load registers it and the
+        request holds it, as for a state computed here. The caller counted it
+        in the request's allocation.
+        """
+        idx = boundary_tokens // self.block_size - 1
+        req_blocks = self.req_to_blocks[request_id]
+        if idx != len(req_blocks) - 2 or not req_blocks[idx].is_null:
+            return
+        req_blocks[idx] = self.block_pool.get_new_blocks(1)[0]
+        self.num_cached_block[request_id] = min(
+            self.num_cached_block.get(request_id, 0), idx
+        )
+
+    def _retain_new_boundaries(
+        self, request: Request, first_block: int, last_block: int
+    ) -> None:
+        """Hold the states a later stage resumes from among the newly hashed blocks.
+
+        These are the prompt-boundary state, the one a block before it, and the
+        deepest state past the prompt among the blocks ``cache_blocks`` just
+        hashed.
+
+        A later stage that extends the prompt resumes from the prompt boundary,
+        one that diverges within a block before it from the previous boundary,
+        and one that extends the whole output from the deepest state. With
+        Eagle a hit drops a block, so a successor diverging within the block
+        before the prompt boundary needs a state that is not held.
+        """
+        prompt_boundary_block = (request.num_prompt_tokens - 1) // self.block_size - 1
+        blocks = self.req_to_blocks[request.request_id]
+        output_held = False
+        for idx in range(last_block - 1, first_block - 1, -1):
+            block = blocks[idx]
+            if block.is_null or block.block_hash is None:
+                continue
+            if idx > prompt_boundary_block:
+                if not output_held:
+                    self._retain_boundary_block(
+                        self._output_boundary_blocks, request.request_id, block
+                    )
+                    output_held = True
+                continue
+            if idx == prompt_boundary_block:
+                self._retain_boundary_block(
+                    self._boundary_blocks, request.request_id, block
+                )
+                continue
+            if idx == prompt_boundary_block - 1:
+                self._retain_boundary_block(
+                    self._prev_boundary_blocks, request.request_id, block
+                )
+            break
+
+    def _retain_hit_boundaries(self, request: Request, num_hit_blocks: int) -> None:
+        """Hold the prompt-boundary states a cache hit covered.
+
+        The request never computes them (see ``_retain_new_boundaries``), so
+        those within ``num_hit_blocks`` are held while they are still cached.
+        """
+        prompt_boundary_block = (request.num_prompt_tokens - 1) // self.block_size - 1
+        block_hashes = None
+        for holds, idx in (
+            (self._boundary_blocks, prompt_boundary_block),
+            (self._prev_boundary_blocks, prompt_boundary_block - 1),
+        ):
+            if not 0 <= idx < num_hit_blocks or request.request_id in holds:
+                continue
+            block = self.req_to_blocks[request.request_id][idx]
+            if not block.is_null and block.block_hash is not None:
+                self._retain_boundary_block(holds, request.request_id, block)
+                continue
+            if block_hashes is None:
+                block_hashes = resolve_block_hashes(
+                    request.block_hashes,
+                    self.block_pool.hash_block_size,
+                    self.block_size,
+                )
+            cached = self.block_pool.get_cached_block(
+                block_hashes[idx], [self.kv_cache_group_id]
+            )
+            if cached is not None:
+                self.block_pool.touch(cached)
+                holds[request.request_id] = cached[0]
+
+    def _retain_boundary_block(
+        self,
+        holds: dict[str, KVCacheBlock],
+        request_id: str,
+        block: KVCacheBlock,
+    ) -> None:
+        """Hold a reusable state block until the request is freed.
+
+        Align mode frees every state below the running one as decode advances,
+        so the one block a later stage can resume from reaches the free queue a
+        step into decode while the request's attention blocks stay referenced.
+        Under allocation pressure the state is recycled first and the hybrid
+        hit, the minimum over groups, collapses to zero although every
+        attention block is still cached. ``pop_blocks_for_free`` releases the
+        hold after the request's other blocks.
+        """
+        assert not block.is_null and block.ref_cnt > 0
+        held = holds.get(request_id)
+        if held is block:
+            return
+        if held is not None:
+            self.block_pool.free_blocks([held])
+        block.ref_cnt += 1
+        holds[request_id] = block
 
     def _cache_partial_tail_block(
         self,

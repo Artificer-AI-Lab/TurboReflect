@@ -17,6 +17,10 @@ from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import (
     deepseek_v4_mhc_warmup,
 )
+from vllm.model_executor.warmup.eager_step_warmup import (
+    eager_decode_warmup,
+    eager_moe_warmup,
+)
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     resolve_flashinfer_autotune_file,
     write_flashinfer_autotune_cache,
@@ -32,6 +36,7 @@ from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
 from vllm.model_executor.warmup.v1_block_table_warmup import (
     warm_v1_block_table_kernels,
 )
+from vllm.model_executor.warmup.vision_encoder_warmup import vision_encoder_warmup
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import is_deep_gemm_supported
 from vllm.utils.flashinfer import has_flashinfer
@@ -69,6 +74,35 @@ def _warmup_ll_bf16_router_gemm() -> None:
     )
 
 
+def _warmup_mla_mask_empty_context(
+    model: torch.nn.Module, device: torch.device
+) -> None:
+    """Compile the context-chunk mask of MLA prefill before serving.
+
+    It runs only for chunked context, so otherwise the first such step compiles
+    it. Triton specializes its integer arguments on 1 and multiples of 16, and
+    its pointers on 16-byte alignment, which a context chunk row past the first
+    does not have.
+    """
+    from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+    from vllm.v1.attention.ops.triton_merge_attn_states import mask_empty_context
+
+    heads = {m.num_heads for m in model.modules() if isinstance(m, MLAAttention)}
+    for num_heads in heads:
+        for num_tokens in (1, 16, 17):
+            for num_reqs in (1, 2, 16):
+                lse = torch.zeros((num_heads, num_tokens), device=device)
+                output = torch.zeros((num_tokens, num_heads, 1), device=device)
+                query_start_loc = torch.linspace(
+                    0, num_tokens, num_reqs + 1, device=device
+                ).to(torch.int32)
+                chunks = torch.zeros(
+                    (2, num_reqs + 1), dtype=torch.int32, device=device
+                )
+                for chunk in chunks:
+                    mask_empty_context(lse, output, query_start_loc, chunk)
+
+
 def kernel_warmup(worker: "Worker"):
     from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
         minimax_m3_msa_warmup,
@@ -81,6 +115,10 @@ def kernel_warmup(worker: "Worker"):
             worker.scheduler_config.max_num_batched_tokens,
         )
     qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
+    _warmup_mla_mask_empty_context(
+        worker.get_model(),
+        getattr(worker.model_runner, "device", torch.device("cuda")),
+    )
 
     # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
     # layer per token; warm them across token sizes first so the first real
@@ -157,6 +195,18 @@ def kernel_warmup(worker: "Worker"):
 
     if worker.vllm_config.kernel_config.enable_cutedsl_warmup:
         cutedsl_warmup()
+
+    vision_encoder_warmup(worker.get_model())
+    if not worker.use_v2_model_runner and not worker.model_runner.is_pooling_model:
+        for warmup in (eager_moe_warmup, eager_decode_warmup):
+            try:
+                warmup(worker.model_runner)
+            except Exception:
+                logger.warning(
+                    "%s failed; its kernels compile on first use.",
+                    warmup.__name__,
+                    exc_info=True,
+                )
 
 
 def _flashinfer_autotune_skip_ops(runner: "GPUModelRunner") -> set[str] | None:

@@ -81,7 +81,10 @@ from vllm.v1.worker.startup_plan import (
 )
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
-from vllm.v1.worker.workspace import init_workspace_manager
+from vllm.v1.worker.workspace import (
+    current_workspace_bytes,
+    init_workspace_manager,
+)
 
 from ...model_executor.model_loader import TensorizerLoader
 from .gpu.warmup import warmup_kernels
@@ -497,6 +500,11 @@ class Worker(WorkerBase):
             # the AMD-CI mem tests), and graph_pool_handle resolves to the same
             # torch.cuda handle the live capture path already uses on ROCm.
             # XPU stays excluded (see #39977).
+            # Attention metadata builders reserve their worst-case workspace
+            # when the profiling KV cache is created below; that reservation
+            # persists but is neither in the torch peak read above nor in the
+            # per-capture graph estimate.
+            workspace_before_graphs = current_workspace_bytes()
             cudagraph_memory_estimate = 0
             if (
                 current_platform.is_cuda_alike()
@@ -509,10 +517,12 @@ class Worker(WorkerBase):
         profile_result.torch_peak_increase = (
             profile_torch_peak - profile_result.before_profile.torch_peak
         )
+        builder_workspace = max(0, current_workspace_bytes() - workspace_before_graphs)
         profile_result.non_kv_cache_memory = (
             profile_result.non_torch_increase
             + profile_result.torch_peak_increase
             + profile_result.weights_memory
+            + builder_workspace
         )
 
         # Respect the opt-in flag as originally designed.

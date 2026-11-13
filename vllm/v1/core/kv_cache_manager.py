@@ -9,7 +9,10 @@ from typing import Literal, overload
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
-from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
+from vllm.v1.core.kv_cache_coordinator import (
+    HybridKVCacheCoordinator,
+    get_kv_cache_coordinator,
+)
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import (
@@ -204,6 +207,10 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
+    def prefix_cache_lookup_enabled(self, request: Request) -> bool:
+        """Whether a local prefix cache lookup may be run for this request."""
+        return self.enable_caching and not request.skip_reading_prefix_cache
+
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
@@ -225,7 +232,7 @@ class KVCacheManager:
         # disabled or the request is marked as skipping kv cache read
         # (which happens when the request requires prompt logprobs
         # or calls a pooling model with all pooling).
-        if not self.enable_caching or request.skip_reading_prefix_cache:
+        if not self.prefix_cache_lookup_enabled(request):
             return self.empty_kv_cache_blocks, 0, 0
 
         # NOTE: When all tokens hit the cache, we must recompute the last token
@@ -269,16 +276,68 @@ class KVCacheManager:
             num_new_computed_tokens + num_uncached if num_uncached else 0
         )
 
-        if self.log_stats:
-            assert self.prefix_cache_stats is not None
-            self.prefix_cache_stats.record(
-                num_tokens=request.num_tokens,
-                num_hits=num_new_computed_tokens,
-                preempted=request.num_preemptions > 0,
-            )
-
         blocks = self.create_kv_cache_blocks(computed_blocks)
         return blocks, num_new_computed_tokens, shared_prefix_boundary
+
+    def record_prefix_cache_stats(self, request: Request, num_hits: int) -> None:
+        # Don't count a request that skipped the cache lookup.
+        if not self.log_stats or not self.prefix_cache_lookup_enabled(request):
+            return
+        assert self.prefix_cache_stats is not None
+        self.prefix_cache_stats.record(
+            num_tokens=request.num_tokens,
+            num_hits=num_hits,
+            preempted=request.num_preemptions > 0,
+        )
+
+    def get_computed_blocks_for_connector(
+        self, request: Request
+    ) -> tuple[KVCacheBlocks, int, int, bool]:
+        """Local prefix-cache lookup for a request scheduled with a KV connector.
+
+        Hybrid (Mamba + full-attention) models can have per-group prefix hits
+        diverge under block pressure: the full-attention tail may be evicted
+        while a deeper Mamba state survives, or vice versa. Report the
+        full-attention hit as the local prefix - the connector transfers the
+        remaining suffix and the Mamba state is transferred unconditionally by
+        nixl's ``_apply_prefix_caching`` - and flag when that hit ran deeper
+        than a lagging group. Such a hit only has a valid Mamba state at its
+        boundary if the connector supplies it, so the caller must fall back to
+        ``get_computed_blocks`` to reconcile when no external tokens are found,
+        and otherwise keep the hit; the scheduler counts it at admission.
+
+        Non-hybrid models and already-convergent hits use ``get_computed_blocks``.
+
+        Returns:
+            The ``get_computed_blocks`` triple (blocks, number of local computed
+            tokens, shared-prefix boundary) plus ``hit_diverged``.
+        """
+        coordinator = self.coordinator
+        if not (
+            self.kv_cache_config.has_mamba_layers
+            and isinstance(coordinator, HybridKVCacheCoordinator)
+            and coordinator.full_attention_group_id is not None
+        ):
+            return *self.get_computed_blocks(request), False
+
+        if not self.prefix_cache_lookup_enabled(request):
+            return self.empty_kv_cache_blocks, 0, 0, False
+
+        fa_group_id = coordinator.full_attention_group_id
+        computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
+            request.block_hashes, request.num_tokens - 1
+        )
+        if any(hit > per_group_hits[fa_group_id] for hit in per_group_hits):
+            # A lagging group hit deeper than full attention means its
+            # full-attention blocks were evicted; use the reconciled boundary
+            # that every group agrees on.
+            return *self.get_computed_blocks(request), False
+
+        num_local = per_group_hits[fa_group_id]
+        blocks = self.create_kv_cache_blocks(computed)
+        diverged = min(per_group_hits) < num_local
+        # Per-group lookups do not detect an uncached shared prefix (boundary 0).
+        return blocks, num_local, 0, diverged
 
     def allocate_slots(
         self,
@@ -293,6 +352,7 @@ class KVCacheManager:
         full_sequence_must_fit: bool = False,
         reserved_blocks: int = 0,
         has_scheduled_reqs: bool = True,
+        external_boundary_tokens: int = 0,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -325,6 +385,11 @@ class KVCacheManager:
                 blocks an already in-flight (prefilling) sequence is relying on.
             has_scheduled_reqs: Whether any requests are already scheduled to run
                 this step, controls whether watermark is applied.
+            external_boundary_tokens: A block boundary inside the external load
+                whose exact Mamba state the connector also writes
+                (`KVConnectorBase_V1.get_external_boundary_tokens`); 0 for none.
+                Backed by a block of its own in each align-mode Mamba group,
+                counted here.
 
         Blocks layout:
         ```
@@ -399,6 +464,14 @@ class KVCacheManager:
             self.max_model_len,
         )
 
+        num_boundary_blocks = (
+            self.coordinator.num_external_boundary_blocks(
+                external_boundary_tokens, total_computed_tokens
+            )
+            if external_boundary_tokens and num_external_computed_tokens > 0
+            else 0
+        )
+
         watermark_blocks = 0
         # The watermark is applied to waiting/preempted requests only, and only
         # when there's at least one request already scheduled.
@@ -422,6 +495,7 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
             )
+            num_blocks_to_allocate += num_boundary_blocks
             required_blocks = num_blocks_to_allocate + watermark_blocks
             if required_blocks > self.block_pool.get_num_free_blocks():
                 return None
@@ -456,6 +530,7 @@ class KVCacheManager:
             num_local_computed_tokens=num_local_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
         )
+        num_blocks_to_allocate += num_boundary_blocks
 
         # Keep `reserved_blocks` free for other in-flight sequences, and an
         # additional watermark of headroom for waiting/preempted admissions.
@@ -477,6 +552,10 @@ class KVCacheManager:
                 num_local_computed_tokens=num_local_computed_tokens,
                 num_external_computed_tokens=num_external_computed_tokens,
             )
+            if num_boundary_blocks:
+                self.coordinator.add_external_boundary_blocks(
+                    request.request_id, external_boundary_tokens, total_computed_tokens
+                )
 
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id,

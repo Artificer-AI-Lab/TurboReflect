@@ -44,6 +44,10 @@ from vllm.model_executor.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.warmup.cutedsl_warmup import (
+    CuTeDSLCompileUnit,
+    register_cutedsl_warmup_provider,
+)
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops import (
     chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
@@ -477,6 +481,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
+        if self.gdn_prefill_backend == "flashinfer":
+            register_cutedsl_warmup_provider(self)
         self._prefill_kernels_warmed_up = False
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
@@ -985,6 +991,78 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         out, _ = self.out_proj(core_attn_out)
         return out
 
+    def get_cutedsl_warmup_compile_units(self) -> tuple[CuTeDSLCompileUnit, ...]:
+        """FlashInfer's varlen GDN prefill kernel, compiled before serving.
+
+        The profile-run warmup prefills one sequence, which FlashInfer may hand
+        to its context-parallel kernel, so the varlen kernel that steps holding
+        several prefills use would otherwise compile inside such a step.
+        """
+        if self.gdn_prefill_backend != "flashinfer":
+            return ()
+        shape = (
+            self.model_config.dtype,
+            self.num_k_heads // self.tp_size,
+            self.num_v_heads // self.tp_size,
+            self.head_k_dim,
+            self.head_v_dim,
+        )
+        return (
+            CuTeDSLCompileUnit(
+                name="flashinfer_gdn_prefill",
+                key=("flashinfer_gdn_prefill", *shape),
+                compile=self._warm_flashinfer_prefill,
+            ),
+        )
+
+    def _warm_flashinfer_prefill(self) -> None:
+        from flashinfer.gdn_prefill import chunk_gated_delta_rule
+
+        num_k_heads = self.num_k_heads // self.tp_size
+        num_v_heads = self.num_v_heads // self.tp_size
+        seq_len = FLA_CHUNK_SIZE
+        num_tokens = 2 * seq_len
+        device = self.A_log.device
+        dtype = self.model_config.dtype
+        q = torch.zeros(
+            num_tokens, num_k_heads, self.head_k_dim, dtype=dtype, device=device
+        )
+        v = torch.zeros(
+            num_tokens, num_v_heads, self.head_v_dim, dtype=dtype, device=device
+        )
+        gate = torch.ones(num_tokens, num_v_heads, dtype=torch.float32, device=device)
+        state = torch.zeros(
+            2,
+            num_v_heads,
+            self.head_v_dim,
+            self.head_k_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        cu_seqlens = torch.tensor(
+            [0, seq_len, num_tokens], dtype=torch.int32, device=device
+        )
+        try:
+            # Few-sequence steps may take the context-parallel kernel instead.
+            chunk_gated_delta_rule(
+                q=q,
+                k=q,
+                v=v,
+                g=gate,
+                beta=gate,
+                initial_state=state,
+                output_final_state=True,
+                cu_seqlens=cu_seqlens,
+                use_cp=False,
+            )
+        except Exception:
+            logger.warning(
+                "FlashInfer GDN prefill warmup failed for layer %s; the first "
+                "multi-sequence prefill will compile it.",
+                self.prefix,
+                exc_info=True,
+            )
+
     def _warmup_prefill_kernels(self, qkv_or_qkvz: torch.Tensor, v_dim: int) -> None:
         """Warm up GDN prefill kernels during V1 profiling.
 
@@ -1249,9 +1327,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 mixed_qkv_spec = mixed_qkv
+                a_spec = a
+                b_spec = b
                 mixed_qkv_non_spec = None
             else:
                 mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
+                a_spec = a.index_select(0, spec_token_indx)
+                b_spec = b.index_select(0, spec_token_indx)
                 mixed_qkv_non_spec = mixed_qkv.index_select(0, non_spec_token_indx)
         else:
             mixed_qkv_spec = None
@@ -1376,8 +1458,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
-                    a=a,
-                    b=b,
+                    a=a_spec,
+                    b=b_spec,
                     dt_bias=self.dt_bias,
                     q=query_spec,
                     k=key_spec,

@@ -1,0 +1,41 @@
+# Qwen3.8-27B on tasks with video clips. The vision tower is on and the context is the
+# model's full 262,144 tokens. A task names its clips in `videos`, relative to its file;
+# the run allows the folder that holds them and takes up to the most clips any task has.
+#
+#   python -m turboreflect calibrate --config turboreflect/configs/qwen3.8-27b-video.yaml
+#   python -m turboreflect run --config turboreflect/configs/qwen3.8-27b-video.yaml \
+#       --out-dir runs/qwen3.8-27b-video
+
+model: Qwen/Qwen3.8-27B
+tasks: tasks/my_video_tasks       # a directory of task files
+program: three_stage              # two_stage, three_stage or multi_round
+
+context_reuse: true
+adaptive_draft_length: true
+kv_cache_dtype: fp8               # fp8 or bf16
+
+gen_tokens: 1024                  # tokens each stage generates
+max_model_len: 262144
+mm_processor_cache_gb: 48
+
+temperature: 1.0                  # the model's recommended sampling
+top_p: 0.95
+top_k: 20
+seed_per_program: true
+
+suffix_num_speculative_tokens: 8
+suffix_max_tree_depth: 24
+
+feedback: goal
+refinement: goal
+layout: requote
+
+attention_backend: FLASH_ATTN
+gdn_prefill_backend: flashinfer
+trust_remote_code: true
+gpu_memory_utilization: 0.9
+max_num_batched_tokens: 16384
+
+env:
+  VLLM_SSM_CONV_STATE_LAYOUT: DS
+  VLLM_KV_CACHE_LAYOUT: HND

@@ -1,0 +1,49 @@
+# GLM-4.7-Flash: latent attention, one GPU per engine.
+#
+#   python -m turboreflect calibrate --config turboreflect/configs/glm-4.7-flash.yaml
+#   python -m turboreflect run --config turboreflect/configs/glm-4.7-flash.yaml \
+#       --out-dir runs/glm-4.7-flash
+#
+# For P/D, add the `pd` block of turboreflect/examples/pd.yaml.
+
+model: zai-org/GLM-4.7-Flash
+tasks: tasks/my_tasks             # a directory of task files
+program: three_stage              # two_stage, three_stage or multi_round
+
+context_reuse: true
+adaptive_draft_length: true
+kv_cache_dtype: fp8_e4m3          # fp8_e4m3 or bf16
+
+gen_tokens: 768                   # tokens each stage generates
+max_model_len: 147456
+
+temperature: 0.6
+top_p: 0.95
+top_k: 0
+seed_per_program: true
+
+suffix_num_speculative_tokens: 16
+suffix_max_tree_depth: 32
+
+feedback: goal
+refinement: goal
+layout: requote
+
+attention_backend: TRITON_MLA
+cudagraph_mode: FULL_AND_PIECEWISE
+gpu_memory_utilization: 0.9
+max_num_batched_tokens: 16384
+
+env:
+  VLLM_KV_CACHE_LAYOUT: HND
+  VLLM_TRITON_MLA_VERIFY: g32
+  VLLM_TRITON_MLA_VERIFY_SPLIT: request
+  VLLM_TRITON_MLA_VERIFY_WARPS: "4"
+
+# To stop each stage at the model's end of sequence:
+#   decode_paths: [quality]
+#   max_tokens_quality: 2048
+
+# RULER and LongBench-v2 tasks have their own stage assembly, which
+# builds one layout:
+#   layout: continue

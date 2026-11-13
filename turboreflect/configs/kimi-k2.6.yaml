@@ -1,0 +1,52 @@
+# Kimi-K2.6 with NVFP4 weights: latent attention, four GPUs per engine.
+#
+# It needs compute capability 10.x. Install `quack-kernels==0.6.1` over the locked 0.6.3,
+# with which vLLM's FA4 prefill does not compile (vLLM #51286).
+#
+#   python -m turboreflect calibrate --config turboreflect/configs/kimi-k2.6.yaml
+#   python -m turboreflect run --config turboreflect/configs/kimi-k2.6.yaml \
+#       --out-dir runs/kimi-k2.6
+#
+# For tasks with clips, remove `language_model_only`, set `max_model_len: 98304` and
+# `mm_processor_cache_gb: 48`, and state the vision chunks a task may hold, for example
+# `limit_mm_per_prompt: {vision_chunk: 12}`.
+
+model: nvidia/Kimi-K2.6-NVFP4
+tasks: tasks/my_tasks             # a directory of task files
+program: three_stage              # two_stage, three_stage or multi_round
+
+context_reuse: true
+adaptive_draft_length: true
+kv_cache_dtype: fp8_e4m3          # fp8_e4m3 or bf16
+
+gen_tokens: 1024                  # tokens each stage generates
+max_model_len: 147456
+
+temperature: 0.6
+top_p: 0.95
+top_k: 0
+seed_per_program: true
+
+suffix_num_speculative_tokens: 16
+suffix_max_tree_depth: 32
+
+feedback: goal
+refinement: goal
+layout: requote
+
+tensor_parallel_size: 4
+attention_backend: FLASHINFER_MLA
+cudagraph_mode: FULL_AND_PIECEWISE
+language_model_only: true
+trust_remote_code: true
+thinking_kwarg: thinking          # the chat template's name for the thinking switch
+gpu_memory_utilization: 0.9
+max_num_batched_tokens: 16384
+
+# To stop each stage at the model's end of sequence:
+#   decode_paths: [quality]
+#   max_tokens_quality: 2048
+
+# RULER and LongBench-v2 tasks have their own stage assembly, which
+# builds one layout:
+#   layout: continue

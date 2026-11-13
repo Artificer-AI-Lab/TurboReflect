@@ -191,6 +191,17 @@ class WorkspaceManager:
         return current_workspace
 
 
+def current_workspace_bytes() -> int:
+    """Bytes held by the workspace manager, 0 when it is not initialized."""
+    if _manager is None:
+        return 0
+    return sum(
+        _manager._workspace_size_bytes(ws)
+        for ws in _manager._current_workspaces
+        if ws is not None
+    )
+
+
 def is_workspace_manager_initialized() -> bool:
     """Check if workspace manager has been initialized.
 

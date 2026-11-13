@@ -49,6 +49,19 @@ class NixlKVConnectorStats(KVConnectorStats):
         self.data["bytes_transferred"].append(res.totalBytes)
         self.data["num_descriptors"].append(res.descCount)
 
+    def record_sliced_read(
+        self, span_s: float, post_s: float, total_bytes: int, desc_count: int
+    ):
+        """Record a read posted in slices as one transfer over its wall span.
+
+        The span runs from the first slice's post to the last slice's completion:
+        slices overlap, so their own durations summed would overstate its time.
+        """
+        self.data["transfer_duration"].append(span_s)
+        self.data["post_duration"].append(post_s)
+        self.data["bytes_transferred"].append(total_bytes)
+        self.data["num_descriptors"].append(desc_count)
+
     def record_failed_transfer(self):
         """Record a failed NIXL transfer operation."""
         self.data["num_failed_transfers"].append(1)

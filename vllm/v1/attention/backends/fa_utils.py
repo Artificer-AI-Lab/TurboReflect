@@ -237,7 +237,7 @@ def get_flash_attn_version(
         # (qk=192, v=128), added upstream in commits 1a15733e/1b36ab19.
         if (
             fa_version == 4
-            and device_capability.major >= 10
+            and device_capability.major in (10, 11)
             and head_size is not None
             and head_size > 128
             and head_size != 192

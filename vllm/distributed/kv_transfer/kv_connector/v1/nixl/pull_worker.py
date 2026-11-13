@@ -3,11 +3,14 @@
 """Pull-specific (READ) worker-side logic for the NIXL connector."""
 
 import time
+from collections import deque
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+    RELEASED_HOLD_GRACE_S,
     NixlBaseConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
@@ -21,13 +24,56 @@ from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.distributed.nixl_utils import nixlXferTelemetry
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
 
-# Slack (seconds) subtracted from D's exported block-expiry deadline on the turn-2
-# readback, absorbing clock-offset error and read latency.
-_KV_BLOCKS_EXPIRY_SAFETY_MARGIN = 5.0
+# NIXL descriptors one step posts reads for; 0 posts every read at once.
+# Posting runs on the step thread, so a long prompt's read posted at once stalls
+# every decode on the engine. A read past the budget is posted in slices over
+# successive steps, however short its holder's lease.
+_MAX_READ_DESCS_PER_STEP = 16384
+
+
+# Prefixes a notification that read nothing: the reader's own prefix cache
+# held all it was offered. Its holder may already have released the blocks
+# (the hold is let go at the reader's first token or its end, which a
+# notification sent over NIXL can trail), so a late one is only logged.
+NOTIF_HIT_PREFIX = "HIT:"
+
+
+@dataclass
+class _ReadXfer:
+    """One remote rank's part of a read, posted in slices of its descriptors."""
+
+    local_xfer_side_handle: int
+    local_desc_ids: np.ndarray
+    remote_xfer_side_handle: int
+    remote_desc_ids: np.ndarray
+    dst_engine_id: str
+    remote_rank: int
+    notif_id: bytes
+    posted: int = 0
+
+
+@dataclass
+class _SlicedRead:
+    """A read posted over several steps.
+
+    The holder releases the blocks on the notification of each remote rank's
+    part, so only that part's last slice carries it, as a whole read's one
+    transfer does, posted once no other slice of the read is in flight. It
+    is recorded as one transfer, over its wall span from `posted_s`, its
+    first slice's post, with its slices' post time, bytes and descriptors.
+    """
+
+    xfers: deque[_ReadXfer] = field(default_factory=deque)
+    failed: bool = False
+    posted_s: float | None = None
+    post_s: float = 0.0
+    total_bytes: int = 0
+    descs: int = 0
 
 
 class NixlPullConnectorWorker(NixlBaseConnectorWorker):
@@ -40,12 +86,30 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         kv_cache_config: "KVCacheConfig",
     ):
         super().__init__(vllm_config, engine_id, kv_cache_config)
+        # Reads waiting for a step with descriptor budget left, in arrival order.
+        self._pending_reads: deque[tuple[str, ReqMeta]] = deque()
+        # Reads posted in slices, in arrival order, from their first slice
+        # until every slice has completed.
+        self._sliced_reads: dict[str, _SlicedRead] = {}
+        # Descriptors this step may still post; None outside a budgeted
+        # _post_pending_reads.
+        self._step_descs_left: int | None = None
+        assert vllm_config.kv_transfer_config is not None
+        self._max_read_descs_per_step: int = (
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "max_read_descs_per_step", _MAX_READ_DESCS_PER_STEP
+            )
+        )
 
     def start_load_kv(self, metadata: NixlConnectorMetadata):
         """
         Start loading by triggering non-blocking nixl_xfer.
         We check for these trnxs to complete in each step().
         """
+        # Before posting reads: posting a backlog can hold this step longer than
+        # a heartbeat extends the lease.
+        self._send_heartbeats(metadata)
+
         for req_id, meta in metadata.reqs_to_recv.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
                 meta.local_block_ids, self._physical_blocks_per_logical_kv_block
@@ -71,12 +135,13 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         self._background_nixl_handshake(req_id, remote_engine_id, meta)
                         continue
 
-            # Handshake already completed, start async read xfer.
-            self._read_blocks_for_req(req_id, meta)
+            # Handshake already completed: queue the read.
+            self._pending_reads.append((req_id, meta))
 
-        # Start transfers for requests whose handshakes have now finished.
+        # Queue reads for requests whose handshakes have now finished.
         while not self._ready_requests.empty():
-            self._read_blocks_for_req(*self._ready_requests.get_nowait())
+            self._pending_reads.append(self._ready_requests.get_nowait())
+        self._post_pending_reads()
 
         # Keep around the requests that have been part of a batch. This is
         # needed because async scheduling pushes the misalignment between the
@@ -98,20 +163,124 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             if req_id in self._reqs_to_process:
                 self._reqs_to_send[req_id] = expiration_time
 
-        # Send heartbeats to P-side engines to keep KV blocks alive while
-        # requests sit in the D scheduler WAITING queue.
-        self._send_heartbeats(metadata)
+    def _post_pending_reads(self) -> None:
+        """Post queued reads, in order, up to this step's descriptor budget.
 
-    def _is_turn2_read_expired(self, meta: ReqMeta) -> bool:
-        """Whether D's cached blocks for this turn-2 readback have (nearly) expired."""
+        NIXL posts a read's descriptors on the step thread, so a backlog, or
+        one long prompt's read, posted at once stalls every decode on this
+        engine. Sliced reads post their next slices first; a new read that
+        does not fit what is left waits for the next step, and one larger than
+        the whole budget is posted in slices from the step it starts.
+
+        A full prefix hit reads nothing and goes at once: its notification is
+        all the holder waits for, and held behind reads it lands after the
+        request has finished, when the holder may have released its blocks.
+        """
+        reads: deque[tuple[str, ReqMeta]] = deque()
+        for req_id, meta in self._pending_reads:
+            if any(len(group) for group in meta.local_physical_block_ids):
+                reads.append((req_id, meta))
+            else:
+                self._read_blocks_for_req(req_id, meta)
+        self._pending_reads = reads
+        budget = self._max_read_descs_per_step
+        if not budget:
+            while self._pending_reads:
+                self._read_blocks_for_req(*self._pending_reads.popleft())
+            return
+        self._step_descs_left = budget
+        try:
+            for req_id, read in list(self._sliced_reads.items()):
+                if read.xfers and self._step_descs_left:
+                    self._continue_sliced_read(req_id, read)
+            while self._pending_reads and self._step_descs_left:
+                req_id, meta = self._pending_reads[0]
+                descs = self.num_regions * sum(
+                    len(group) for group in meta.local_physical_block_ids
+                )
+                if self._step_descs_left < min(descs, budget):
+                    return
+                self._pending_reads.popleft()
+                self._read_blocks_for_req(req_id, meta)
+        finally:
+            self._step_descs_left = None
+
+    def _continue_sliced_read(self, req_id: str, read: _SlicedRead) -> None:
+        meta = self._recving_metadata[req_id]
         assert meta.remote is not None
-        blocks_expiry_time = meta.remote.blocks_expiry_time
-        # Deadline may be absent (router may not forward it) -> read as usual.
-        if blocks_expiry_time is None or not meta.local_physical_block_ids:
-            return False
-        clock_offset = self._engine_clock_offset[meta.remote.engine_id]
-        deadline = blocks_expiry_time - clock_offset
-        return time.perf_counter() + _KV_BLOCKS_EXPIRY_SAFETY_MARGIN >= deadline
+        self._engine_last_active[meta.remote.engine_id] = time.perf_counter()
+        if self._is_lease_expired(meta):
+            logger.warning(
+                "Declining the rest of expired remote read for %s from engine %s.",
+                req_id,
+                meta.remote.engine_id,
+            )
+            self.xfer_stats.record_kv_expired_req()
+            self._handle_failed_transfer(req_id, None)
+            return
+        self._post_read_slices(req_id, read)
+
+    def _slices_in_flight(self, req_id: str) -> bool:
+        """Whether a posted slice of the read is not yet done.
+
+        One whose state cannot be read counts as in flight, and
+        `_pop_done_transfers` fails it.
+        """
+        for handle in self._recving_transfers.get(req_id, ()):
+            try:
+                if self.nixl_wrapper.check_xfer_state(handle) != "DONE":
+                    return True
+            except Exception:
+                return True
+        return False
+
+    def _post_read_slices(self, req_id: str, read: _SlicedRead) -> None:
+        """Post the read's next slices, up to the descriptors this step has left.
+
+        A part's last descriptor, which carries its notification, goes only once
+        no slice is in flight.
+        """
+        while read.xfers and self._step_descs_left != 0:
+            xfer = read.xfers[0]
+            start = xfer.posted
+            end = len(xfer.local_desc_ids)
+            if self._step_descs_left is not None:
+                end = min(end, start + self._step_descs_left)
+            last = end == len(xfer.local_desc_ids)
+            if last and self._slices_in_flight(req_id):
+                end, last = end - 1, False
+                if end == start:
+                    return
+            handle = None
+            try:
+                handle = self.nixl_wrapper.make_prepped_xfer(
+                    "READ",
+                    xfer.local_xfer_side_handle,
+                    xfer.local_desc_ids[start:end],
+                    xfer.remote_xfer_side_handle,
+                    xfer.remote_desc_ids[start:end],
+                    notif_msg=xfer.notif_id if last else b"",
+                )
+                if read.posted_s is None:
+                    read.posted_s = time.perf_counter()
+                self.nixl_wrapper.transfer(handle)
+                self._recving_transfers[req_id].append(handle)
+            except Exception as e:
+                self._log_failure(
+                    failure_type="transfer_setup_failed",
+                    req_id=req_id,
+                    msg="Marking blocks as invalid",
+                    error=e,
+                    dst_engine_id=xfer.dst_engine_id,
+                    remote_rank=xfer.remote_rank,
+                )
+                self._handle_failed_transfer(req_id, handle)
+                return
+            if self._step_descs_left is not None:
+                self._step_descs_left = max(0, self._step_descs_left - (end - start))
+            xfer.posted = end
+            if last:
+                read.xfers.popleft()
 
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
         assert meta.remote is not None and self.transfer_topo is not None
@@ -120,7 +289,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # thread (this one), so we don't race on this structure.
         self._engine_last_active[engine_id] = time.perf_counter()
 
-        if self._bidirectional_kv_xfer_enabled and self._is_turn2_read_expired(meta):
+        if self._is_lease_expired(meta):
+            if not any(meta.local_physical_block_ids):
+                # Nothing to read, and the remote already released the blocks.
+                return
             logger.warning(
                 "Declining expired remote read for %s from engine %s.",
                 req_id,
@@ -207,6 +379,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             # ..but we still need to notify the other remote ranks that we
             # have the blocks we need so they can update the request state.
             notif_id = f"{meta.remote.request_id}:{self.world_size}".encode()
+            if not any(meta.local_physical_block_ids):
+                notif_id = NOTIF_HIT_PREFIX.encode() + notif_id
             remote_agents = self._remote_agents[meta.remote.engine_id]
             for rank_to_notify, agent in remote_agents.items():
                 if rank_to_notify != (0, read_specs[0].remote_rank):
@@ -278,7 +452,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             # A full prefix cache hit is indicated with an empty list.
             agent_name = self._remote_agents[dst_engine_id][(0, remote_rank)]
             try:
-                self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
+                self.nixl_wrapper.send_notif(
+                    agent_name, notif_msg=NOTIF_HIT_PREFIX.encode() + notif_id
+                )
             except Exception as e:
                 self._log_failure(
                     failure_type="notification_failed",
@@ -323,6 +499,31 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
 
+        num_descs = len(local_block_descs_ids)
+        read = self._sliced_reads.get(request_id)
+        left = self._step_descs_left
+        # Past what this step has left, or behind a part already sliced.
+        if num_descs and (read is not None or (left is not None and num_descs > left)):
+            if read is None:
+                read = self._sliced_reads[request_id] = _SlicedRead()
+            elif read.failed:
+                return
+            read.xfers.append(
+                _ReadXfer(
+                    local_xfer_side_handle=local_xfer_side_handle,
+                    local_desc_ids=local_block_descs_ids,
+                    remote_xfer_side_handle=remote_xfer_side_handle,
+                    remote_desc_ids=remote_block_descs_ids,
+                    dst_engine_id=dst_engine_id,
+                    remote_rank=remote_rank,
+                    notif_id=notif_id,
+                )
+            )
+            self._post_read_slices(request_id, read)
+            return
+        if left is not None:
+            self._step_descs_left = left - num_descs
+
         # Prepare transfer with Nixl.
         handle = None
         try:
@@ -352,6 +553,67 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             )
             self._handle_failed_transfer(request_id, handle)
 
+    def _pop_done_transfers(self, transfers: dict[str, list[int]]) -> set[str]:
+        """Also hold a sliced read back until its last slice is done.
+
+        It is then reported done, or failed if a slice failed or the holder's
+        lease ran out while its slices were in flight.
+        """
+        done = super()._pop_done_transfers(transfers)
+        for req_id in done & self._sliced_reads.keys():
+            read = self._sliced_reads[req_id]
+            if read.xfers:
+                done.discard(req_id)
+                continue
+            del self._sliced_reads[req_id]
+            meta = self._recving_metadata[req_id]
+            if not read.failed and self._lease_left_s(meta) <= 0:
+                # Its holder may have let the blocks go under its slices.
+                assert meta.remote is not None
+                logger.warning(
+                    "Read of %s from engine %s completed past the holder's "
+                    "lease: marking its blocks invalid.",
+                    req_id,
+                    meta.remote.engine_id,
+                )
+                self.xfer_stats.record_kv_expired_req()
+                read.failed = True
+            if read.failed:
+                super()._handle_failed_transfer(req_id, None)
+                continue
+            assert read.posted_s is not None
+            self.xfer_stats.record_sliced_read(
+                time.perf_counter() - read.posted_s,
+                read.post_s,
+                read.total_bytes,
+                read.descs,
+            )
+        return done
+
+    def _record_transfer(self, req_id: str, res: "nixlXferTelemetry") -> None:
+        read = self._sliced_reads.get(req_id)
+        if read is None:
+            super()._record_transfer(req_id, res)
+            return
+        read.post_s += res.postDuration / 1e6
+        read.total_bytes += res.totalBytes
+        read.descs += res.descCount
+
+    def _handle_failed_transfer(self, req_id: str, handle: int | None):
+        read = self._sliced_reads.get(req_id)
+        if read is None:
+            super()._handle_failed_transfer(req_id, handle)
+            return
+        # Slices still in flight write into the request's blocks: it is
+        # reported failed once they are done (_pop_done_transfers).
+        if handle is not None:
+            self.nixl_wrapper.release_xfer_handle(handle)
+        read.failed = True
+        read.xfers.clear()
+        if not self._recving_transfers.get(req_id):
+            del self._sliced_reads[req_id]
+            super()._handle_failed_transfer(req_id, None)
+
     def _get_new_notifs(self) -> set[str]:
         """
         Get req_ids which got a remote xfer message. When multiple consumers
@@ -372,17 +634,40 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     self._handle_heartbeat(msg[3:])
                     continue
 
+                read = not msg.startswith(NOTIF_HIT_PREFIX)
+                if not read:
+                    msg = msg[len(NOTIF_HIT_PREFIX) :]
                 req_id, tp_size = msg.rsplit(":", 1)
                 if (
                     req_id not in self._reqs_to_send
                     and req_id not in self._reqs_to_process
                 ):
-                    logger.error(
-                        "Potentially invalid KV blocks for "
-                        "unrecognized request %s were retrieved by "
-                        "a decode worker. They may have expired.",
-                        req_id,
-                    )
+                    released = self._released_holds.get(req_id)
+                    if (
+                        read
+                        and released is not None
+                        and time.perf_counter() - released <= RELEASED_HOLD_GRACE_S
+                    ):
+                        # Released at its owner's request once the reader had
+                        # landed the read, whose notification came later.
+                        logger.info(
+                            "A read of %s was notified after its hold was "
+                            "released at its owner's request.",
+                            req_id,
+                        )
+                    elif read:
+                        logger.error(
+                            "Potentially invalid KV blocks for "
+                            "unrecognized request %s were retrieved by "
+                            "a decode worker. They may have expired.",
+                            req_id,
+                        )
+                    else:
+                        logger.debug(
+                            "A full prefix hit for %s arrived after its blocks "
+                            "were released; nothing was read.",
+                            req_id,
+                        )
                     continue
 
                 # NOTE: `tp_ratio` is the opposite when swapping local<>remote

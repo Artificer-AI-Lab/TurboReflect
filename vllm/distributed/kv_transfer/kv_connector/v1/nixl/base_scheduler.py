@@ -40,12 +40,44 @@ from vllm.v1.kv_cache_interface import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.kv_cache_utils import KVCacheBlock
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def select_mamba_pull_state(
+    states: list[list[Any]],
+    remote_num_tokens: int,
+    num_prompt_tokens: int,
+    num_computed_tokens: int,
+    block_size: int,
+) -> list[Any] | None:
+    """The recurrent state a hybrid P loads from a D's held history, if any.
+
+    ``states`` is D's ``remote_mamba_states``: ``[num_tokens, [block id per
+    Mamba group]]`` for each position whose exact state D holds. P loads the
+    latest one within the offer (``remote_num_tokens``, which a reader may cut)
+    that leaves at least its last prompt token to compute and lies past its
+    own block-aligned hit; the attention blocks are cut to that position.
+
+    Returns:
+        That ``[num_tokens, block_ids]`` entry, or None for no pull.
+    """
+    if num_computed_tokens % block_size:
+        return None
+    limit = min(remote_num_tokens, num_prompt_tokens - 1)
+    best = None
+    for entry in states:
+        if num_computed_tokens < entry[0] <= limit and (
+            best is None or entry[0] > best[0]
+        ):
+            best = entry
+    return best
 
 
 class NixlBaseConnectorScheduler:
@@ -135,6 +167,45 @@ class NixlBaseConnectorScheduler:
             for n_tokens, block_size in sw_sizes_tokens
         ]
 
+        # Trailing scratch slots that mamba managers co-allocate per request
+        # for speculative decoding; None for non-SSM groups.
+        self._ssm_spec_blocks = [
+            g.kv_cache_spec.num_speculative_blocks
+            if isinstance(g.kv_cache_spec, MambaSpec)
+            else None
+            for g in kv_cache_config.kv_cache_groups
+        ]
+        # Only "all" mode keeps a state per block position; the other modes
+        # keep a single running state in the last non-speculative slot.
+        self._ssm_state_slots_are_positional = (
+            vllm_config.cache_config.mamba_cache_mode == "all"
+        )
+        # A D's held history can be pulled into a hybrid P at a block boundary
+        # whose exact state D caches (align mode) or at its running state. Only
+        # full-attention groups beside the Mamba ones, one block size, and
+        # synchronous scheduling, under which every cached block is computed.
+        groups = kv_cache_config.kv_cache_groups
+        self._mamba_group_ids = [
+            i for i, g in enumerate(groups) if isinstance(g.kv_cache_spec, MambaSpec)
+        ]
+        self._mamba_prefix_pull = bool(self._mamba_group_ids) and (
+            not self._ssm_state_slots_are_positional
+            and not vllm_config.scheduler_config.async_scheduling
+            and all(
+                isinstance(g.kv_cache_spec, MambaSpec)
+                or (
+                    type(g.kv_cache_spec) is FullAttentionSpec
+                    and g.kv_cache_spec.sliding_window is None
+                )
+                for g in groups
+            )
+            and {g.kv_cache_spec.block_size for g in groups} == {self.block_size}
+        )
+        # Bound by bind_gpu_block_pool: the cached boundary states a hybrid D
+        # exports are pinned in it until the hold on their request ends.
+        self._block_pool: BlockPool | None = None
+        self._mamba_state_pins: dict[ReqId, list[KVCacheBlock]] = {}
+
         # Threshold to decide whether to compute kv cache locally
         # or pull from a remote node: minimum number of remote
         # tokens to amortize the xfer latencies
@@ -175,6 +246,14 @@ class NixlBaseConnectorScheduler:
     def on_new_request(self, request: "Request") -> None:
         """Track a request that may need heartbeats."""
         params = request.kv_transfer_params
+        if (
+            params is not None
+            and params.get("do_remote_decode")
+            and not params.get("decode_after_pull")
+            and self._has_mamba
+        ):
+            self._truncate_mamba_request_for_prefill(request)
+
         # NOTE (NickLucche) This excludes request meant for P, ie heartbeats are
         # effectively disabled for Bidirectional KV transfer.
         if params is None or not params.get("do_remote_prefill"):
@@ -218,13 +297,25 @@ class NixlBaseConnectorScheduler:
                     # Clean up empty engines so we don't leak a key when remote dies.
                     del self._heartbeat_by_engine[engine_id]
 
-    def get_sw_clipped_blocks(self, block_ids: BlockIds) -> BlockIds:
-        """
-        Clip the number of blocks to the sliding window size for each kv cache group
-        that employs SWA.
-        This is necessary because the KV Cache manager initially allocates blocks for
-        the entire sequence length, and successively cleans up blocks that are outside
-        the window prior to the `request_finished_all_groups` hook.
+    def get_exchange_clipped_blocks(
+        self, block_ids: BlockIds, clip_ssm: bool = True
+    ) -> BlockIds:
+        """Clip a request's block lists down to the transferable blocks.
+
+        Sliding-window groups keep only the in-window tail: the KV cache
+        manager allocates blocks for the entire sequence length and cleans up
+        out-of-window blocks only prior to the `request_finished_all_groups`
+        hook.
+
+        SSM groups keep only their state-bearing slots: the trailing
+        speculative scratch slots always go, and in single-state cache modes
+        so does everything before the running state (null placeholders and
+        the previous step's superseded state). "all" mode keeps its remaining
+        slots, which the worker pairs position-wise.
+
+        Use this at every block-id exchange point. Pass ``clip_ssm=False``
+        for per-step partial lists (host-buffer save), where the SSM strip
+        does not apply.
         """
         if len(block_ids) == 0 or not self._is_hma_required:
             # No blocks to clip eg Full prefix cache hit or not a hybrid model.
@@ -235,15 +326,202 @@ class NixlBaseConnectorScheduler:
         assert len(block_ids) == len(self.blocks_per_sw), (
             "Number of KV cache groups must match"
         )
-        # For non-SWA groups, blocks_per_sw is 0 so we return all block_ids unchanged
-        return tuple(
-            [
-                blocks[-self.blocks_per_sw[i] :]
-                if self.blocks_per_sw[i] > 0
-                else blocks
-                for i, blocks in enumerate(block_ids)
-            ]
+        clipped = []
+        for i, blocks in enumerate(block_ids):
+            if n_sw := self.blocks_per_sw[i]:
+                blocks = blocks[-n_sw:]
+            elif (
+                clip_ssm
+                and blocks
+                and (n_spec_blocks := self._ssm_spec_blocks[i]) is not None
+            ):
+                if n_spec := min(n_spec_blocks, len(blocks) - 1):
+                    blocks = blocks[:-n_spec]
+                if not self._ssm_state_slots_are_positional:
+                    # Never empty: downstream reads that as a full prefix hit.
+                    blocks = blocks[-1:]
+            clipped.append(blocks)
+        return tuple(clipped)
+
+    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
+        self._block_pool = gpu_block_pool
+
+    def _export_mamba_states(
+        self, request: "Request", num_tokens: int, block_ids: BlockIds
+    ) -> list[list[Any]]:
+        """Return the exact recurrent states exported with a held request.
+
+        On D these are what a P may load of the held history. On P the range
+        is the prompt's last boundary, for D to cache (`_mamba_boundary_state`).
+
+        The entries are each block boundary from the prompt's last one up to
+        ``num_tokens`` whose state every Mamba group has in the prefix cache
+        (align mode caches a block only once it holds the state at its end),
+        pinned until the hold ends, and the running state at ``num_tokens``,
+        in the request's last state slot, where no speculative step can have
+        left the accepted state in a scratch slot and the computed count was
+        not cut back by the output's end.
+
+        Args:
+            request: The finished request whose blocks are held.
+            num_tokens: The tokens whose KV the hold offers.
+            block_ids: The request's exchange-clipped block ids.
+
+        Returns:
+            ``[num_tokens, [block id per Mamba group]]`` entries, ascending.
+        """
+        if not self._mamba_prefix_pull:
+            return []
+        block_size = self.block_size
+        states: list[list[Any]] = []
+        pool = self._block_pool
+        if pool is not None and pool.enable_caching:
+            from vllm.v1.core.kv_cache_utils import resolve_block_hashes
+
+            hashes = resolve_block_hashes(
+                request.block_hashes, pool.hash_block_size, block_size
+            )
+            pins: list[KVCacheBlock] = []
+            # From the block ending at the prompt's last boundary: earlier ones
+            # the P that prefilled the prompt holds itself.
+            first = max(request.num_prompt_tokens // block_size - 1, 0)
+            for i in range(first, min(num_tokens // block_size, len(hashes))):
+                blocks = pool.get_cached_block(hashes[i], self._mamba_group_ids)
+                if blocks is None:
+                    continue
+                pool.touch(blocks)
+                pins.extend(blocks)
+                states.append([(i + 1) * block_size, [b.block_id for b in blocks]])
+            if pins:
+                self._mamba_state_pins[request.request_id] = pins
+        if (
+            not any(self._ssm_spec_blocks[g] for g in self._mamba_group_ids)
+            and request.num_computed_tokens <= request.num_tokens
+            and num_tokens % block_size
+            and all(block_ids[g] for g in self._mamba_group_ids)
+        ):
+            states.append(
+                [num_tokens, [block_ids[g][-1] for g in self._mamba_group_ids]]
+            )
+        return states
+
+    def _release_mamba_state_pins(self, request_id: ReqId) -> None:
+        pins = self._mamba_state_pins.pop(request_id, None)
+        if pins:
+            assert self._block_pool is not None
+            self._block_pool.free_blocks(pins)
+
+    def _mamba_pull_state(
+        self, request: "Request", num_computed_tokens: int
+    ) -> list[Any] | None:
+        """Return the state of D's export that P loads, or None for no pull.
+
+        See `select_mamba_pull_state`. An export from a D that names no exact
+        states also gives None.
+        """
+        params = request.kv_transfer_params
+        assert params is not None
+        states = params.get("remote_mamba_states")
+        if (
+            not self._mamba_prefix_pull
+            or states is None
+            or params.get("remote_block_size") != self.block_size
+        ):
+            return None
+        return select_mamba_pull_state(
+            states,
+            params.get("remote_num_tokens") or 0,
+            request.num_prompt_tokens,
+            num_computed_tokens,
+            self.block_size,
         )
+
+    def _mamba_boundary_state(
+        self, request: "Request", num_tokens: int, num_computed_tokens: int
+    ) -> list[Any] | None:
+        """Return the state P exported at the last block boundary inside D's load.
+
+        Runs on D. The load covers `num_tokens`, and the boundary must lie past
+        D's own hit. The state comes from `_export_mamba_states`; None for no
+        such state.
+
+        A prompt prefilled here caches the state at that boundary, which a
+        later stage extending the prompt resumes from. A load ending past it
+        writes only the running state at its end, so D reads this one beside
+        it (`get_external_boundary_tokens`, `_add_mamba_boundary_read`).
+        """
+        params = request.kv_transfer_params
+        assert params is not None
+        states = params.get("remote_mamba_states")
+        if not states or params.get("remote_block_size") != self.block_size:
+            return None
+        pool = self._block_pool
+        if not self._mamba_prefix_pull or pool is None or not pool.enable_caching:
+            return None
+        boundary = num_tokens // self.block_size * self.block_size
+        if not num_computed_tokens < boundary < num_tokens:
+            return None
+        return next((entry for entry in states if entry[0] == boundary), None)
+
+    def get_external_boundary_tokens(self, request: "Request") -> int:
+        """Return the boundary of the state `_mamba_boundary_state` chose."""
+        params = request.kv_transfer_params
+        state = params.get("_mamba_boundary_state") if params else None
+        return state[0] if state else 0
+
+    def _add_mamba_boundary_read(
+        self,
+        params: dict[str, Any],
+        state: list[Any],
+        blocks: "KVCacheBlocks",
+        local_block_ids: BlockIds,
+    ) -> BlockIds:
+        """Pair P's boundary state with the block that backs that boundary on D.
+
+        Runs on D. The block comes from the KV cache manager, and the pair goes
+        ahead of the running state in each Mamba group; the worker pairs
+        equal-length lists slot for slot. Nothing changes where no such block
+        was given.
+
+        Returns:
+            The local block ids to read into; `params` gets the remote ones.
+        """
+        idx = state[0] // self.block_size - 1
+        remote = list(params["remote_block_ids"])
+        targets = []
+        for g in self._mamba_group_ids:
+            group = blocks.blocks[g]
+            block = group[idx] if idx < len(group) else None
+            if (
+                block is None
+                or block.is_null
+                or block.block_hash is not None
+                or len(local_block_ids[g]) != 1
+                or len(remote[g]) != 1
+            ):
+                return local_block_ids
+            targets.append(block.block_id)
+        local = list(local_block_ids)
+        for g, local_id, remote_id in zip(self._mamba_group_ids, targets, state[1]):
+            local[g] = [local_id, *local[g]]
+            remote[g] = [remote_id, *remote[g]]
+        params["remote_block_ids"] = remote
+        return tuple(local)
+
+    def _cut_to_mamba_state(self, params: dict[str, Any], state: list[Any]) -> None:
+        """Point P's read at ``state``.
+
+        Each attention group keeps its blocks up to that position, which the
+        worker pairs from the end with the blocks P allocated. Each Mamba group
+        keeps the block holding the state, paired with P's one state slot.
+        """
+        num_blocks = cdiv(state[0], self.block_size)
+        mamba_ids = iter(state[1])
+        params["remote_block_ids"] = [
+            [next(mamba_ids)] if i in self._mamba_group_ids else group[:num_blocks]
+            for i, group in enumerate(params["remote_block_ids"])
+        ]
+        params["remote_num_tokens"] = state[0]
 
     def set_xfer_handshake_metadata(
         self, metadata: dict[tuple[int, int], KVConnectorHandshakeMetadata]
@@ -380,7 +658,9 @@ class NixlBaseConnectorScheduler:
             req = req_to_save
 
             assert req.kv_transfer_params is not None
-            clipped_block_id_groups = self.get_sw_clipped_blocks(new_block_id_groups)
+            clipped_block_id_groups = self.get_exchange_clipped_blocks(
+                new_block_id_groups, clip_ssm=False
+            )
             meta.add_new_req_to_save(
                 request_id=req_id,
                 local_block_ids=clipped_block_id_groups,
@@ -435,6 +715,15 @@ class NixlBaseConnectorScheduler:
         self._reqs_need_send = {}
 
         return meta
+
+    def release_hold(self, request_id: ReqId) -> None:
+        """End a finished request's hold on its blocks: no reader will come.
+
+        The blocks are freed as if the hold had expired, at the worker's next
+        `get_transfer_results`; an id the worker holds nothing for is ignored
+        there.
+        """
+        self._reqs_need_send[request_id] = 0.0
 
     def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
         """Stop heartbeating for requests whose KV transfer completed."""

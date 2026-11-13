@@ -1,0 +1,44 @@
+# Locality-aware P/D: two prefill and two decode engines on four GPUs of one node.
+#
+#   python -m turboreflect calibrate --config turboreflect/examples/pd.yaml
+#   python -m turboreflect run --config turboreflect/examples/pd.yaml --out-dir runs/pd
+
+model: zai-org/GLM-4.7-Flash
+tasks: tasks/my_tasks             # a directory of task files
+program: three_stage
+
+context_reuse: true
+adaptive_draft_length: true
+kv_cache_dtype: fp8_e4m3
+
+gen_tokens: 768
+max_model_len: 147456
+
+temperature: 0.6
+top_p: 0.95
+top_k: 0
+seed_per_program: true
+
+suffix_num_speculative_tokens: 16
+suffix_max_tree_depth: 32
+
+feedback: goal
+refinement: goal
+layout: requote
+
+attention_backend: TRITON_MLA
+cudagraph_mode: FULL_AND_PIECEWISE
+gpu_memory_utilization: 0.9
+max_num_batched_tokens: 16384
+
+env:
+  VLLM_KV_CACHE_LAYOUT: HND
+  VLLM_TRITON_MLA_VERIFY: g32
+  VLLM_TRITON_MLA_VERIFY_SPLIT: request
+  VLLM_TRITON_MLA_VERIFY_WARPS: "4"
+
+pd:
+  prefill: 2
+  decode: 2
+  delta: 1.0                      # the relative decode-latency budget
+  max_num_seqs: 17                # how many programs at their longest fit an engine

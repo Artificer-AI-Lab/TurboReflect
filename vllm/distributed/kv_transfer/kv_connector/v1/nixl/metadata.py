@@ -160,6 +160,7 @@ class RemoteMeta:
     engine_id: str
     request_id: str
     blocks_expiry_time: float | None = None
+    blocks_lease_duration: float | None = None
 
 
 @dataclass
@@ -229,5 +230,8 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             host=kv_transfer_params["remote_host"],
             port=kv_transfer_params["remote_port"],
             blocks_expiry_time=kv_transfer_params.get("remote_blocks_expiry_time"),
+            blocks_lease_duration=kv_transfer_params.get(
+                "remote_blocks_lease_duration"
+            ),
         )
         self.reqs_to_recv[request_id] = req

@@ -173,6 +173,7 @@ class RequestState:
         self.queue = queue
         self.num_cached_tokens = 0
         self.num_cache_creation_tokens = 0
+        self.num_external_cached_tokens = 0
 
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
 
@@ -379,6 +380,7 @@ class RequestState:
             ec_transfer_params=ec_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
             num_cache_creation_tokens=self.num_cache_creation_tokens,
+            num_external_cached_tokens=self.num_external_cached_tokens,
             metrics=self.stats,
         )
 
@@ -643,6 +645,9 @@ class OutputProcessor:
                     )
                     req_state.num_cache_creation_tokens = (
                         engine_core_output.prefill_stats.num_cache_creation_tokens
+                    )
+                    req_state.num_external_cached_tokens = (
+                        engine_core_output.prefill_stats.num_external_cached_tokens
                     )
                 req_state.is_prefilling = False
 

@@ -87,6 +87,11 @@ if TYPE_CHECKING:
     VLLM_MAIN_CUDA_VERSION: str = "13.0"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
+    VLLM_TRITON_MLA_VERIFY: Literal["uniform", "r16", "r32", "g32"] = "uniform"
+    VLLM_TRITON_MLA_VERIFY_SPLIT: Literal["request", "row"] = "request"
+    VLLM_TRITON_MLA_VERIFY_WARPS: int = 4
+    VLLM_TRITON_MLA_VERIFY_ROUTE_Q1: bool = False
+    VLLM_SPEC_SINGLE_TOKEN_FULL_GRAPH: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
     # Deprecated alias of VLLM_TRITON_USE_TD (removed in v0.25).
     VLLM_TRITON_ATTN_USE_TD: bool | None = None
@@ -600,6 +605,38 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    # TRITON_MLA speculative verification. "uniform" routes only uniform
+    # query-length batches to decode (the default). "r16"/"r32" route
+    # any short query lengths to decode with one row per query token and a
+    # 16/32-row head tile; "g32" packs a request's query/head rows into shared
+    # 32-row tiles so one KV load serves several queries.
+    "VLLM_TRITON_MLA_VERIFY": env_with_choices(
+        "VLLM_TRITON_MLA_VERIFY", "uniform", ["uniform", "r16", "r32", "g32"]
+    ),
+    # KV split partition for the r16/r32/g32 verify rows: "request" splits by
+    # the request's final length (required by g32), "row" by each row's causal
+    # length (the native single-token partition; r16/r32 only).
+    "VLLM_TRITON_MLA_VERIFY_SPLIT": env_with_choices(
+        "VLLM_TRITON_MLA_VERIFY_SPLIT", "request", ["request", "row"]
+    ),
+    # Warps per stage1 program for the r16/r32/g32 verify rows, the same for
+    # all three so the variants differ only in tiling (native decode uses 4).
+    "VLLM_TRITON_MLA_VERIFY_WARPS": lambda: int(
+        os.getenv("VLLM_TRITON_MLA_VERIFY_WARPS", "4")
+    ),
+    # Run a ragged r32/g32 verify batch's single-token requests on the decode
+    # kernel instead of a 32-row verify tile each.
+    "VLLM_TRITON_MLA_VERIFY_ROUTE_Q1": lambda: (
+        os.getenv("VLLM_TRITON_MLA_VERIFY_ROUTE_Q1", "0").strip().lower()
+        not in ("0", "false", "off")
+    ),
+    # With speculative decoding, also capture FULL decode cudagraphs for batches
+    # where every request schedules one token (no drafts this step). Without
+    # it such batches miss the 1 + num_speculative_tokens graphs and run
+    # PIECEWISE.
+    "VLLM_SPEC_SINGLE_TOKEN_FULL_GRAPH": lambda: bool(
+        int(os.getenv("VLLM_SPEC_SINGLE_TOKEN_FULL_GRAPH", "0"))
+    ),
     # Use tensor descriptors for Q/K/V loads and output stores in the
     # Triton unified-attention kernel.  Enables HW 2D block reads on
     # Intel XPU; the non-TD branch is dead-code-eliminated at Triton
@@ -2173,6 +2210,12 @@ def compile_factors() -> dict[str, object]:
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",
+        # Attention metadata and kernel launch choices, outside compiled graphs.
+        "VLLM_TRITON_MLA_VERIFY",
+        "VLLM_TRITON_MLA_VERIFY_SPLIT",
+        "VLLM_TRITON_MLA_VERIFY_WARPS",
+        "VLLM_TRITON_MLA_VERIFY_ROUTE_Q1",
+        "VLLM_SPEC_SINGLE_TOKEN_FULL_GRAPH",
     }
 
     from vllm.config.utils import normalize_value

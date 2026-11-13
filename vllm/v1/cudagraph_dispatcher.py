@@ -4,6 +4,7 @@ from collections.abc import Set as AbstractSet
 from dataclasses import replace
 from itertools import product
 
+import vllm.envs as envs
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
@@ -35,6 +36,22 @@ class CudagraphDispatcher:
         self.vllm_config = vllm_config
         self.compilation_config = vllm_config.compilation_config
         self.uniform_decode_query_len = 1 + self.vllm_config.num_speculative_tokens
+        # Speculative decoding: also key FULL graphs for one-token decode batches.
+        self.single_token_full_graph = (
+            self.uniform_decode_query_len > 1 and envs.VLLM_SPEC_SINGLE_TOKEN_FULL_GRAPH
+        )
+        if self.single_token_full_graph:
+            # The capture sizes are multiples of 1 + K under speculative
+            # decoding, so one-token batches pad to sizes of their own.
+            max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
+            self._single_token_sizes = sorted(
+                {1, 2, 4, *range(8, max_num_seqs + 1, 8), max_num_seqs}
+                & set(range(1, max_num_seqs + 1))
+            )
+            self._single_token_padded_size = [0] + [
+                next(s for s in self._single_token_sizes if s >= n)
+                for n in range(1, max_num_seqs + 1)
+            ]
 
         # Dict to store valid cudagraph dispatching keys.
         self.cudagraph_keys: dict[CUDAGraphMode, set[BatchDescriptor]] = {
@@ -135,10 +152,14 @@ class CudagraphDispatcher:
         uniform_decode: bool,
         has_lora: bool,
         num_active_loras: int = 0,
+        uniform_query_len: int | None = None,
     ) -> BatchDescriptor:
         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
-        uniform_decode_query_len = self.uniform_decode_query_len
-        num_tokens_padded = self._bs_to_padded_graph_size[num_tokens]
+        uniform_decode_query_len = uniform_query_len or self.uniform_decode_query_len
+        if uniform_query_len == 1 and self.single_token_full_graph:
+            num_tokens_padded = self._single_token_padded_size[num_tokens]
+        else:
+            num_tokens_padded = self._bs_to_padded_graph_size[num_tokens]
 
         if uniform_decode and self.cudagraph_mode.has_mode(CUDAGraphMode.FULL):
             num_reqs = min(num_tokens_padded // uniform_decode_query_len, max_num_seqs)
@@ -229,6 +250,20 @@ class CudagraphDispatcher:
                         bs, True, num_active_loras > 0, num_active_loras
                     ),
                 )
+            if self.single_token_full_graph:
+                for bs, num_active_loras in product(
+                    self._single_token_sizes, lora_cases
+                ):
+                    self.add_cudagraph_key(
+                        CUDAGraphMode.FULL,
+                        self._create_padded_batch_descriptor(
+                            bs,
+                            True,
+                            num_active_loras > 0,
+                            num_active_loras,
+                            uniform_query_len=1,
+                        ),
+                    )
 
         self.keys_initialized = True
 
@@ -240,6 +275,7 @@ class CudagraphDispatcher:
         num_active_loras: int = 0,
         valid_modes: AbstractSet[CUDAGraphMode] | None = None,
         invalid_modes: AbstractSet[CUDAGraphMode] | None = None,
+        single_token_decode: bool = False,
     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
         """
         Given conditions(e.g.,batch descriptor and if using piecewise only),
@@ -259,6 +295,9 @@ class CudagraphDispatcher:
                 valid_modes to compute allowed modes. (e.g., {FULL} for
                 features like cascade attention not supported by full
                 cudagraphs). None means no modes are excluded.
+            single_token_decode: Whether every request schedules exactly one
+                token while speculative decoding is configured. Dispatched to
+                the one-token FULL graphs when they are captured.
         """
         allowed_modes = valid_modes or CUDAGraphMode.valid_runtime_modes()
 
@@ -299,9 +338,20 @@ class CudagraphDispatcher:
                 )
                 effective_num_active_loras = self.vllm_config.lora_config.max_loras + 1
 
-        normalized_uniform = uniform_decode and self.cudagraph_mode.separate_routine()
+        single_token = (
+            single_token_decode
+            and self.single_token_full_graph
+            and self.cudagraph_mode.separate_routine()
+        )
+        normalized_uniform = (
+            uniform_decode or single_token
+        ) and self.cudagraph_mode.separate_routine()
         batch_desc = self._create_padded_batch_descriptor(
-            num_tokens, normalized_uniform, has_lora, effective_num_active_loras
+            num_tokens,
+            normalized_uniform,
+            has_lora,
+            effective_num_active_loras,
+            uniform_query_len=1 if single_token else None,
         )
 
         if CUDAGraphMode.FULL in allowed_modes:

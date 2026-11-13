@@ -107,6 +107,8 @@ class RequestOutput:
             prefix-cache writes for this request.
         kv_transfer_params: The params for remote K/V transfer.
         ec_transfer_params: The params for remote encoder-cache transfer.
+        num_external_cached_tokens: The part of `num_cached_tokens` supplied by
+            a KV connector rather than the local prefix cache.
     """
 
     def __init__(
@@ -126,6 +128,7 @@ class RequestOutput:
         *,
         kv_transfer_params: dict[str, Any] | None = None,
         ec_transfer_params: dict[str, Any] | None = None,
+        num_external_cached_tokens: int | None = None,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -146,6 +149,7 @@ class RequestOutput:
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
         self.num_cache_creation_tokens = num_cache_creation_tokens
+        self.num_external_cached_tokens = num_external_cached_tokens
         self.kv_transfer_params = kv_transfer_params
         self.ec_transfer_params = ec_transfer_params
 

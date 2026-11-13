@@ -1829,6 +1829,32 @@ def get_kv_cache_capacity(
     return int(max_concurrency * max_model_len), max_concurrency
 
 
+def kv_pool_layout(kv_cache_config: KVCacheConfig) -> dict[str, int]:
+    """Describe how the pool's blocks are spent per sequence.
+
+    Each token group takes a block per `block_size` tokens. Each Mamba group
+    takes a fixed number whatever the length: its running and speculative state
+    slots and, in align mode, the one a partial prefix hit adds and the two
+    boundary states a request keeps for a later stage's hit (its prompt's and
+    its deepest past it).
+    """
+    token_groups = state_groups = fixed = 0
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, MambaSpec):
+            state_groups += 1
+            fixed += 1 + spec.num_speculative_blocks
+            fixed += 3 * int(spec.mamba_cache_mode == "align")
+        else:
+            token_groups += 1
+    return {
+        "num_blocks": kv_cache_config.num_blocks,
+        "token_groups": max(1, token_groups),
+        "state_groups": state_groups,
+        "fixed_blocks_per_sequence": fixed,
+    }
+
+
 def _max_memory_usage_bytes_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
