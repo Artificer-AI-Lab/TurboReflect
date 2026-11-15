@@ -4,7 +4,11 @@ This is the repository accompanying the paper:
 
 > **TurboReflect: Infrastructure Optimization for Efficient Agentic Reflection**
 >
-> Anonymous submission
+> [Ruixuan An](https://github.com/Ruixuan-An)\*, [Zeyu Zhang](https://steve-zeyu-zhang.github.io/)\*†, [Xinxin Tang](https://github.com/TangXinxin-899), and [Dong Gong](https://donggong1.github.io/)‡
+>
+> \*Equal contribution. †Project lead. ‡Corresponding author.
+>
+> #### [Paper]() | [Website]()
 
 
 ## Overview
